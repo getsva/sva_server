@@ -1,0 +1,935 @@
+# authentication/views.py
+
+import base64
+import hashlib
+import hmac
+import logging
+import uuid
+
+import requests
+from django.conf import settings
+from django.utils import timezone
+from requests.exceptions import RequestException
+from rest_framework import generics
+from rest_framework import serializers
+from rest_framework import status
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from .models import ZKUser, ZKRefreshToken, ZKEmailVerificationToken
+from .serializers import (
+    ZKRegisterSerializer, 
+    ZKLoginSerializer, 
+    ZKUserDetailsSerializer,
+    ZKUserDataSerializer,
+    ZKUpdateProfileSerializer,
+    ZKGetSaltSerializer,
+    ZKPasskeyRegisterSerializer,
+    ZKPasskeyRemoveSerializer,
+    ZKEmailVerificationRequestSerializer,
+    ZKEmailVerificationConfirmSerializer,
+    ZKEmailLoginSerializer,
+    ZKGetSaltByEmailSerializer,
+)
+from .token_utils import generate_access_token, generate_refresh_token, generate_data_token
+
+
+logger = logging.getLogger(__name__)
+from .email_service import send_verification_email, send_welcome_email
+
+
+# ==================== ZERO-KNOWLEDGE AUTHENTICATION VIEWS ====================
+
+class ZKGetSaltView(APIView):
+    """
+    Get user's salt for login (Step 1 of login)
+    Now also returns passkey credential ID if available
+    """
+    permission_classes = [AllowAny]
+    
+    def post(self, request):
+        serializer = ZKGetSaltSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        username_hash = serializer.validated_data['username_hash']
+        
+        try:
+            user = ZKUser.objects.get(username_hash=username_hash, is_active=True)
+            return Response({
+                'salt': user.salt,
+                'exists': True,
+                'has_passkey': user.has_passkey,
+                'passkey_credential_id': user.passkey_credential_id if user.has_passkey else None
+            })
+        except ZKUser.DoesNotExist:
+            # Return consistent fake data to prevent user enumeration
+            from django.conf import settings
+            
+            fake_salt_bytes = hmac.new(
+                settings.SECRET_KEY.encode(),
+                username_hash.encode(),
+                hashlib.sha256
+            ).digest()[:16]
+            
+            fake_salt = base64.b64encode(fake_salt_bytes).decode()
+            
+            return Response({
+                'salt': fake_salt,
+                'exists': False,
+                'has_passkey': False,
+                'passkey_credential_id': None
+            })
+
+
+class ZKRegisterView(generics.CreateAPIView):
+    """
+    Zero-Knowledge Registration Endpoint
+    Now supports passkey registration
+    """
+    permission_classes = (AllowAny,)
+    serializer_class = ZKRegisterSerializer
+    
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        username_hash = serializer.validated_data['username_hash']
+        auth_proof = serializer.validated_data['auth_proof']
+        device_fingerprint = serializer.validated_data['device_fingerprint']
+        passkey_credential_id = serializer.validated_data.get('passkey_credential_id')
+        passkey_public_key = serializer.validated_data.get('passkey_public_key')
+        use_both_methods = serializer.validated_data.get('use_both_methods', False)
+        
+        # Double-check uniqueness
+        if ZKUser.objects.filter(username_hash=username_hash).exists():
+            return Response(
+                {"error": "An account with this username already exists."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if ZKUser.objects.filter(auth_proof=auth_proof).exists():
+            return Response(
+                {"error": "An account with this master key already exists."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if ZKUser.objects.filter(device_fingerprint=device_fingerprint).exists():
+            return Response(
+                {"error": "This device is already registered to another account. One device per user policy enforced."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Create the zero-knowledge user
+        has_passkey = bool(passkey_credential_id)
+        
+        zk_user = ZKUser.objects.create(
+            encrypted_data=serializer.validated_data['encrypted_data'],
+            salt=serializer.validated_data['salt'],
+            auth_proof=serializer.validated_data['auth_proof'],
+            username_hash=serializer.validated_data['username_hash'],
+            device_fingerprint=device_fingerprint,
+            passkey_credential_id=passkey_credential_id,
+            passkey_public_key=passkey_public_key,
+            has_passkey=has_passkey
+        )
+        
+        # Generate tokens
+        access_token = generate_access_token(zk_user)
+        refresh_token = generate_refresh_token(
+            zk_user, 
+            auth_method='passkey' if has_passkey else 'master_key',
+            device_fingerprint=device_fingerprint
+        )
+        
+        # Determine available authentication methods
+        auth_methods = []
+        if has_passkey:
+            auth_methods.append("passkey")
+        if not use_both_methods or True:  # Master key is always available
+            auth_methods.append("master_key")
+        
+        return Response({
+            "message": "Registration successful",
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "user": ZKUserDetailsSerializer(zk_user).data,
+            "auth_method": "passkey" if has_passkey else "master_key",
+            "available_auth_methods": auth_methods,
+            "flexible_auth": len(auth_methods) > 1
+        }, status=status.HTTP_201_CREATED)
+
+
+class ZKLoginView(generics.GenericAPIView):
+    """
+    Zero-Knowledge Login Endpoint
+    Works with both master key and passkey authentication
+    """
+    permission_classes = (AllowAny,)
+    serializer_class = ZKLoginSerializer
+    
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        auth_proof = serializer.validated_data['auth_proof']
+        device_fingerprint = serializer.validated_data['device_fingerprint']
+        
+        try:
+            zk_user = ZKUser.objects.get(auth_proof=auth_proof, is_active=True)
+            # Device fingerprint check removed for login flexibility
+        except ZKUser.DoesNotExist:
+            return Response(
+                {"error": "Invalid credentials or master key"},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+        
+        # Update last login
+        zk_user.last_login = timezone.now()
+        zk_user.save(update_fields=['last_login'])
+        
+        # Determine auth method
+        auth_method = 'passkey' if zk_user.has_passkey else 'master_key'
+        
+        # Generate tokens
+        access_token = generate_access_token(zk_user)
+        refresh_token = generate_refresh_token(zk_user, auth_method=auth_method, device_fingerprint=device_fingerprint)
+        
+        return Response({
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "user": ZKUserDetailsSerializer(zk_user).data,
+            "encrypted_data": zk_user.encrypted_data,
+            "salt": zk_user.salt,
+            "auth_method": auth_method
+        })
+
+
+class ZKLogoutView(APIView):
+    """
+    Logout by invalidating refresh token
+    """
+    permission_classes = (IsAuthenticated,)
+    
+    def post(self, request, *args, **kwargs):
+        try:
+            refresh_token = request.data.get("refresh_token")
+            if not refresh_token:
+                return Response(
+                    {"error": "Refresh token is required."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            token = ZKRefreshToken.objects.get(
+                user=request.user,
+                token=refresh_token
+            )
+            token.delete()
+            
+            return Response(
+                {"message": "Successfully logged out."},
+                status=status.HTTP_200_OK
+            )
+        except ZKRefreshToken.DoesNotExist:
+            return Response(
+                {"error": "Invalid refresh token."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+
+class ZKTokenRefreshView(APIView):
+    """
+    Refresh access token using refresh token
+    """
+    permission_classes = (AllowAny,)
+    
+    def post(self, request, *args, **kwargs):
+        refresh_token_value = request.data.get("refresh_token")
+        if not refresh_token_value:
+            return Response(
+                {"error": "Refresh token is required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            token = ZKRefreshToken.objects.get(token=refresh_token_value)
+            
+            if token.is_expired:
+                token.delete()
+                return Response(
+                    {"error": "Refresh token has expired."},
+                    status=status.HTTP_401_UNAUTHORIZED
+                )
+            
+            new_access_token = generate_access_token(token.user)
+            return Response({"access_token": new_access_token})
+            
+        except ZKRefreshToken.DoesNotExist:
+            return Response(
+                {"error": "Invalid refresh token."},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+
+# ==================== USER DATA MANAGEMENT VIEWS ====================
+
+class ZKGetUserDataView(APIView):
+    """
+    Returns encrypted user data for client-side decryption
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        serializer = ZKUserDataSerializer(request.user)
+        return Response(serializer.data)
+
+
+class ZKUpdateUserDataView(APIView):
+    """
+    Update user's encrypted data
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def patch(self, request):
+        serializer = ZKUpdateProfileSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        request.user.encrypted_data = serializer.validated_data['encrypted_data']
+        request.user.updated_at = timezone.now()
+        request.user.save(update_fields=['encrypted_data', 'updated_at'])
+        
+        return Response({
+            'message': 'Profile updated successfully',
+            'user': ZKUserDetailsSerializer(request.user).data
+        })
+
+
+class ZKDeleteAccountView(APIView):
+    """
+    Delete user account
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def delete(self, request):
+        auth_proof = request.data.get('auth_proof')
+        
+        if not auth_proof:
+            return Response(
+                {'error': 'Master key verification required (auth_proof)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if request.user.auth_proof != auth_proof:
+            return Response(
+                {'error': 'Invalid master key'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+        
+        # Delete all refresh tokens
+        ZKRefreshToken.objects.filter(user=request.user).delete()
+        
+        # Soft delete
+        request.user.is_active = False
+        request.user.save(update_fields=['is_active'])
+        
+        return Response({
+            'message': 'Account deleted successfully'
+        }, status=status.HTTP_200_OK)
+
+
+# ==================== PASSKEY MANAGEMENT VIEWS ====================
+
+class ZKPasskeyRegisterView(APIView):
+    """
+    Add passkey to existing account
+    Allows users to enable biometric authentication
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request):
+        serializer = ZKPasskeyRegisterSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        # Check if user already has a passkey
+        if request.user.has_passkey:
+            return Response(
+                {'error': 'Account already has a passkey registered'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Update user with passkey
+        request.user.passkey_credential_id = serializer.validated_data['passkey_credential_id']
+        request.user.passkey_public_key = serializer.validated_data.get('passkey_public_key')
+        request.user.has_passkey = True
+        request.user.save(update_fields=[
+            'passkey_credential_id', 
+            'passkey_public_key', 
+            'has_passkey'
+        ])
+        
+        return Response({
+            'message': 'Passkey registered successfully',
+            'user': ZKUserDetailsSerializer(request.user).data
+        }, status=status.HTTP_200_OK)
+
+
+class ZKPasskeyRemoveView(APIView):
+    """
+    Remove passkey from account
+    Requires master key verification
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request):
+        serializer = ZKPasskeyRemoveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        auth_proof = serializer.validated_data['auth_proof']
+        
+        # Verify auth proof
+        if request.user.auth_proof != auth_proof:
+            return Response(
+                {'error': 'Invalid master key verification'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+        
+        # Check if user has a passkey
+        if not request.user.has_passkey:
+            return Response(
+                {'error': 'No passkey registered on this account'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Remove passkey
+        request.user.passkey_credential_id = None
+        request.user.passkey_public_key = None
+        request.user.has_passkey = False
+        request.user.save(update_fields=[
+            'passkey_credential_id', 
+            'passkey_public_key', 
+            'has_passkey'
+        ])
+        
+        return Response({
+            'message': 'Passkey removed successfully',
+            'user': ZKUserDetailsSerializer(request.user).data
+        }, status=status.HTTP_200_OK)
+
+
+class ZKPasskeyStatusView(APIView):
+    """
+    Check passkey status for current user
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        return Response({
+            'has_passkey': request.user.has_passkey,
+            'passkey_credential_id': request.user.passkey_credential_id if request.user.has_passkey else None,
+            'can_add_passkey': not request.user.has_passkey
+        })
+
+
+# ==================== UTILITY/TESTING VIEWS ====================
+
+class ZKProtectedView(APIView):
+    """
+    Example protected endpoint
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        return Response({
+            'message': 'This is a protected endpoint!',
+            'user': ZKUserDetailsSerializer(request.user).data,
+            'note': 'Your encrypted data is stored securely. Decrypt it client-side with your master key or passkey.'
+        }, status=status.HTTP_200_OK)
+
+
+class ZKHealthCheckView(APIView):
+    """
+    Health check endpoint
+    """
+    permission_classes = [AllowAny]
+    
+    def get(self, request):
+        return Response({
+            'status': 'healthy',
+            'service': 'Zero-Knowledge Authentication',
+            'version': '2.0.0',
+            'features': ['master_key', 'passkey', 'webauthn']
+        })
+
+
+class ZKStatsView(APIView):
+    """
+    Get basic statistics
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        total_users = ZKUser.objects.filter(is_active=True).count()
+        passkey_users = ZKUser.objects.filter(is_active=True, has_passkey=True).count()
+        active_tokens = ZKRefreshToken.objects.filter(
+            expires_at__gt=timezone.now()
+        ).count()
+        
+        return Response({
+            'total_active_users': total_users,
+            'passkey_enabled_users': passkey_users,
+            'active_sessions': active_tokens,
+            'passkey_adoption_rate': f"{(passkey_users/total_users*100):.1f}%" if total_users > 0 else "0%",
+            'note': 'Server has zero knowledge of user credentials'
+        })
+
+
+# ==================== OAUTH CONSENT ORCHESTRATION VIEWS ====================
+
+
+class AuthServerClientMixin:
+    """Shared helpers for communicating with the OAuth orchestration service."""
+
+    auth_base_path = '/api/auth'
+
+    def _call_auth_service(self, method: str, endpoint: str, **kwargs):
+        base_url = settings.SVA_AUTH_SERVER_BASE_URL.rstrip('/')
+        endpoint = endpoint if endpoint.startswith('/') else f'/{endpoint}'
+        url = f"{base_url}{endpoint}"
+
+        headers = kwargs.pop('headers', {}) or {}
+        headers[settings.INTERNAL_SERVICE_HEADER] = settings.INTERNAL_SERVICE_TOKEN
+
+        timeout = getattr(settings, 'INTERNAL_SERVICE_TIMEOUT', 5)
+
+        logger.debug('Calling auth service %s %s', method.upper(), url)
+        response = requests.request(method, url, headers=headers, timeout=timeout, **kwargs)
+        return response
+
+    def _fetch_auth_request(self, auth_request_id: uuid.UUID):
+        try:
+            response = self._call_auth_service(
+                'get',
+                f"{self.auth_base_path}/internal/auth-request-details/",
+                params={'auth_request_id': str(auth_request_id)},
+            )
+        except RequestException as exc:
+            logger.error('Failed to reach OAuth auth server: %s', exc)
+            raise
+
+        return response
+
+
+class DataAttestationSerializer(serializers.Serializer):
+    auth_request_id = serializers.UUIDField()
+    user_id = serializers.UUIDField()
+    audience = serializers.CharField(max_length=255)
+    claims = serializers.DictField(child=serializers.JSONField())
+
+
+class DataAttestationView(AuthServerClientMixin, APIView):
+    """Issue signed data tokens for approved authorization requests."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = DataAttestationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        if str(request.user.id) != str(data['user_id']):
+            return Response({'error': 'user_id mismatch'}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            auth_response = self._fetch_auth_request(data['auth_request_id'])
+        except RequestException:
+            return Response({'error': 'oauth_service_unavailable'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        if auth_response.status_code != status.HTTP_200_OK:
+            logger.warning('Auth request validation failed: %s', auth_response.text)
+            try:
+                payload = auth_response.json()
+            except ValueError:
+                payload = {'error': 'unexpected_response'}
+            return Response(payload, status=auth_response.status_code)
+
+        try:
+            auth_request = auth_response.json()
+        except ValueError:
+            logger.error('Auth server returned non-JSON payload for auth request %s', data['auth_request_id'])
+            return Response({'error': 'unexpected_response'}, status=status.HTTP_502_BAD_GATEWAY)
+
+        if auth_request.get('status') != 'pending':
+            return Response({'error': 'auth_request_not_pending'}, status=status.HTTP_400_BAD_REQUEST)
+
+        client_id = auth_request.get('client', {}).get('client_id')
+        if client_id != data['audience']:
+            return Response({'error': 'audience_mismatch'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Validate that claims are permitted by requested scopes
+        # Map scopes to allowed claim keys
+        # This includes both standard OAuth scopes and Identity Block scopes
+        scope_to_claims = {
+            'openid': set(),  # openid doesn't map to specific claims, but allows 'sub' claim
+            'email': {'email'},
+            'profile': {'full_name', 'name', 'given_name', 'family_name'},
+            'name': {'full_name', 'name', 'given_name', 'family_name', 'first_name', 'last_name'},  # Identity Block: Name
+            'username': {'username'},  # Identity Block: Username
+            # Add other Identity Block scopes as needed
+            'bio': {'bio'},
+            'pronoun': {'pronoun', 'pronouns'},
+            'dob': {'dob', 'date_of_birth', 'birthdate'},
+            'images': {'profile_image', 'banner_image', 'images'},
+            'skills': {'skills'},
+            'hobby': {'hobbies', 'hobby'},
+            'address': {'address', 'address_line1', 'address_line2', 'city', 'state', 'postal_code', 'country'},
+            'social': {'social_links', 'social'},
+            'phone': {'phone', 'phone_number'},
+            'pan_card': {'pan_card', 'pan'},
+            'crypto_wallet': {'crypto_wallet', 'wallet_address'},
+            'education': {'education'},
+            'employment': {'employment'},
+            'professional_license': {'professional_license', 'license'},
+            'aadhar': {'aadhar', 'aadhaar'},
+            'driving_license': {'driving_license', 'driving_licence'},
+            'voter_id': {'voter_id', 'voterid'},
+            'passport': {'passport'},
+        }
+        
+        requested_scopes = set(auth_request.get('requested_scopes', []))
+        claim_keys = set(data['claims'].keys())
+        
+        # Build set of all allowed claim keys based on requested scopes
+        allowed_claim_keys = set()
+        for scope in requested_scopes:
+            if scope in scope_to_claims:
+                allowed_claim_keys.update(scope_to_claims[scope])
+            # Also allow the scope name itself as a claim key (for custom scopes)
+            allowed_claim_keys.add(scope)
+        
+        # Allow 'sub' claim if openid scope is present
+        if 'openid' in requested_scopes:
+            allowed_claim_keys.add('sub')
+        
+        # Check if all claim keys are permitted
+        if requested_scopes and not claim_keys.issubset(allowed_claim_keys):
+            logger.warning(
+                'Claims validation failed: requested_scopes=%s, claim_keys=%s, allowed_claim_keys=%s',
+                requested_scopes,
+                claim_keys,
+                allowed_claim_keys,
+            )
+            return Response({'error': 'claims_not_permitted'}, status=status.HTTP_400_BAD_REQUEST)
+
+        data_token = generate_data_token(
+            user=request.user,
+            claims=data['claims'],
+            audience=data['audience'],
+            auth_request_id=data['auth_request_id'],
+        )
+
+        logger.info(
+            'Issued data token for auth_request %s and audience %s',
+            data['auth_request_id'],
+            data['audience'],
+        )
+
+        return Response({'data_token': data_token})
+
+
+class AuthRequestDetailProxyView(AuthServerClientMixin, APIView):
+    """Proxy to retrieve authorization request details for the consent UI."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, auth_request_id: uuid.UUID):
+        try:
+            response = self._fetch_auth_request(auth_request_id)
+        except RequestException:
+            return Response({'error': 'oauth_service_unavailable'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        if response.status_code != status.HTTP_200_OK:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {'error': 'unexpected_response'}
+            return Response(payload, status=response.status_code)
+
+        payload = response.json()
+        return Response(payload)
+
+
+class ConsentCompletionSerializer(serializers.Serializer):
+    approved_scopes = serializers.ListField(
+        child=serializers.CharField(max_length=255),
+        required=False,
+        allow_empty=True,
+    )
+    data_token = serializers.CharField()
+
+
+class AuthRequestConsentProxyView(AuthServerClientMixin, APIView):
+    """Proxy to confirm consent with the OAuth orchestration service."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, auth_request_id: uuid.UUID):
+        serializer = ConsentCompletionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        payload = {
+            'auth_request_id': str(auth_request_id),
+            'user_id': str(request.user.id),
+            'approved_scopes': data.get('approved_scopes', []),
+            'data_token': data['data_token'],
+        }
+
+        try:
+            response = self._call_auth_service(
+                'post',
+                f"{self.auth_base_path}/internal/consent-complete/",
+                json=payload,
+            )
+        except RequestException as exc:
+            logger.error('Failed to notify auth server of consent completion: %s', exc)
+            return Response({'error': 'oauth_service_unavailable'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        if response.status_code != status.HTTP_200_OK:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {'error': 'unexpected_response'}
+            return Response(payload, status=response.status_code)
+
+        return Response(response.json())
+
+
+# ==================== EMAIL VERIFICATION VIEWS ====================
+
+class ZKEmailVerificationRequestView(APIView):
+    """
+    Request email verification for registration
+    Stores encrypted data temporarily until email is verified
+    """
+    permission_classes = [AllowAny]
+    
+    def post(self, request):
+        serializer = ZKEmailVerificationRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        email = serializer.validated_data['email']
+        email_hash = hashlib.sha256(email.encode()).hexdigest()
+        device_fingerprint = serializer.validated_data['device_fingerprint']
+        
+        # Create verification token with encrypted data
+        verification_token = ZKEmailVerificationToken.objects.create(
+            email_hash=email_hash,
+            encrypted_data=serializer.validated_data['encrypted_data'],
+            salt=serializer.validated_data['salt'],
+            auth_proof=serializer.validated_data['auth_proof'],
+            username_hash=serializer.validated_data['username_hash'],
+            device_fingerprint=device_fingerprint,
+            passkey_credential_id=serializer.validated_data.get('passkey_credential_id'),
+            passkey_public_key=serializer.validated_data.get('passkey_public_key'),
+            use_both_methods=serializer.validated_data.get('use_both_methods', False)
+        )
+        
+        # Send verification email
+        email_sent = send_verification_email(email, str(verification_token.token))
+        
+        if not email_sent:
+            # If email fails, still return success but log the issue
+            print(f"Warning: Failed to send verification email to {email}")
+        
+        return Response({
+            'message': 'Verification email sent. Please check your email to complete registration.',
+            'email': email,  # Return email for confirmation
+            'expires_in_hours': 24,
+            'email_sent': email_sent
+        }, status=status.HTTP_201_CREATED)
+
+
+class ZKEmailVerificationConfirmView(APIView):
+    """
+    Confirm email verification and complete registration
+    """
+    permission_classes = [AllowAny]
+    
+    def post(self, request):
+        serializer = ZKEmailVerificationConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        token = serializer.validated_data['token']
+        
+        try:
+            verification_token = ZKEmailVerificationToken.objects.get(
+                token=token,
+                is_used=False
+            )
+        except ZKEmailVerificationToken.DoesNotExist:
+            return Response(
+                {"error": "Invalid or expired verification token."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not verification_token.is_valid:
+            return Response(
+                {"error": "Verification token has expired."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Create the zero-knowledge user
+        has_passkey = bool(verification_token.passkey_credential_id)
+        
+        zk_user = ZKUser.objects.create(
+            email_hash=verification_token.email_hash,
+            encrypted_data=verification_token.encrypted_data,
+            salt=verification_token.salt,
+            auth_proof=verification_token.auth_proof,
+            username_hash=verification_token.username_hash,
+            device_fingerprint=verification_token.device_fingerprint,
+            passkey_credential_id=verification_token.passkey_credential_id,
+            passkey_public_key=verification_token.passkey_public_key,
+            has_passkey=has_passkey,
+            email_verified=True
+        )
+        
+        # Mark verification token as used
+        verification_token.is_used = True
+        verification_token.save()
+        
+        # Send welcome email (we need to get the email from the verification token)
+        # For now, we'll skip the welcome email since we don't have the original email
+        # In a production system, you might want to store the email in the verification token
+        # send_welcome_email(email, str(zk_user.id))
+        
+        # Determine available authentication methods
+        auth_methods = []
+        if has_passkey:
+            auth_methods.append("passkey")
+        if not verification_token.use_both_methods or True:  # Master key is always available
+            auth_methods.append("master_key")
+        
+        # Return success response without tokens - user needs to login separately
+        response_data = {
+            "message": "Email verified and registration successful. Please login to continue.",
+            "user": ZKUserDetailsSerializer(zk_user).data,
+            "available_auth_methods": auth_methods,
+            "flexible_auth": len(auth_methods) > 1
+        }
+        
+        # If using both methods, include additional data for client storage
+        if verification_token.use_both_methods and has_passkey:
+            response_data["salt"] = verification_token.salt
+            response_data["passkey_credential_id"] = verification_token.passkey_credential_id
+        
+        return Response(response_data, status=status.HTTP_201_CREATED)
+
+
+class ZKGetSaltByEmailView(APIView):
+    """
+    Get user's salt by email (Step 1 of email login)
+    """
+    permission_classes = [AllowAny]
+    
+    def post(self, request):
+        serializer = ZKGetSaltByEmailSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        email = serializer.validated_data['email']
+        email_hash = hashlib.sha256(email.encode()).hexdigest()
+        
+        try:
+            user = ZKUser.objects.get(email_hash=email_hash, is_active=True, email_verified=True)
+            print(f"🔍 User found: {user.id}, has_passkey: {user.has_passkey}, passkey_credential_id: {user.passkey_credential_id}")
+            return Response({
+                'salt': user.salt,
+                'exists': True,
+                'has_passkey': user.has_passkey,
+                'passkey_credential_id': user.passkey_credential_id if user.has_passkey else None
+            })
+        except ZKUser.DoesNotExist:
+            # Return consistent fake data to prevent user enumeration
+            from django.conf import settings
+            
+            fake_salt_bytes = hmac.new(
+                settings.SECRET_KEY.encode(),
+                email_hash.encode(),
+                hashlib.sha256
+            ).digest()[:16]
+            
+            fake_salt = base64.b64encode(fake_salt_bytes).decode()
+            
+            return Response({
+                'salt': fake_salt,
+                'exists': False,
+                'has_passkey': False,
+                'passkey_credential_id': None
+            })
+
+
+class ZKEmailLoginView(generics.GenericAPIView):
+    """
+    Zero-Knowledge Login using Email
+    """
+    permission_classes = (AllowAny,)
+    serializer_class = ZKLoginSerializer
+    
+    def post(self, request, *args, **kwargs):
+        # First get email to find user
+        email_serializer = ZKEmailLoginSerializer(data=request.data)
+        email_serializer.is_valid(raise_exception=True)
+        
+        email = email_serializer.validated_data['email']
+        email_hash = hashlib.sha256(email.encode()).hexdigest()
+        
+        # Then validate auth proof and device fingerprint
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        auth_proof = serializer.validated_data['auth_proof']
+        device_fingerprint = serializer.validated_data['device_fingerprint']
+        
+        try:
+            # Handle passkey-only users with special marker
+            if auth_proof == "passkey_authenticated":
+                zk_user = ZKUser.objects.get(
+                    email_hash=email_hash,
+                    is_active=True,
+                    email_verified=True,
+                    has_passkey=True
+                )
+            else:
+                # Regular master key authentication
+                zk_user = ZKUser.objects.get(
+                    email_hash=email_hash,
+                    auth_proof=auth_proof, 
+                    is_active=True,
+                    email_verified=True
+                )
+            # Device fingerprint check removed for login flexibility
+        except ZKUser.DoesNotExist:
+            return Response(
+                {"error": "Invalid credentials or master key"},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+        
+        # Update last login
+        zk_user.last_login = timezone.now()
+        zk_user.save(update_fields=['last_login'])
+        
+        # Determine auth method
+        auth_method = 'passkey' if zk_user.has_passkey else 'master_key'
+        
+        # Generate tokens
+        access_token = generate_access_token(zk_user)
+        refresh_token = generate_refresh_token(zk_user, auth_method=auth_method, device_fingerprint=device_fingerprint)
+        
+        return Response({
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "user": ZKUserDetailsSerializer(zk_user).data,
+            "encrypted_data": zk_user.encrypted_data,
+            "salt": zk_user.salt,
+            "auth_method": auth_method
+        })
