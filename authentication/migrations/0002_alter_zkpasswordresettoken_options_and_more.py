@@ -4,6 +4,89 @@ import uuid
 from django.db import migrations, models
 
 
+def convert_password_reset_token_id_to_uuid(apps, schema_editor):
+    """
+    Convert ZKPasswordResetToken.id from BigAutoField to UUIDField.
+    This handles the conversion properly for PostgreSQL.
+    """
+    # Get the model to find the table name
+    ZKPasswordResetToken = apps.get_model('authentication', 'ZKPasswordResetToken')
+    table_name = ZKPasswordResetToken._meta.db_table
+    
+    # Add new UUID column
+    schema_editor.execute(f"""
+        ALTER TABLE {schema_editor.quote_name(table_name)} 
+        ADD COLUMN new_id UUID DEFAULT gen_random_uuid();
+    """)
+    
+    # Update all rows to have unique UUIDs
+    schema_editor.execute(f"""
+        UPDATE {schema_editor.quote_name(table_name)} 
+        SET new_id = gen_random_uuid();
+    """)
+    
+    # Drop the old primary key constraint (get the actual constraint name)
+    with schema_editor.connection.cursor() as cursor:
+        # Get current schema (defaults to 'public' for PostgreSQL)
+        cursor.execute("SELECT current_schema();")
+        schema_name = cursor.fetchone()[0] or 'public'
+        
+        cursor.execute("""
+            SELECT constraint_name 
+            FROM information_schema.table_constraints 
+            WHERE table_schema = %s
+            AND table_name = %s 
+            AND constraint_type = 'PRIMARY KEY';
+        """, [schema_name, table_name])
+        result = cursor.fetchone()
+        if result:
+            pk_constraint = result[0]
+            schema_editor.execute(f"""
+                ALTER TABLE {schema_editor.quote_name(table_name)} 
+                DROP CONSTRAINT {schema_editor.quote_name(pk_constraint)};
+            """)
+    
+    # Drop the old id column
+    schema_editor.execute(f"""
+        ALTER TABLE {schema_editor.quote_name(table_name)} 
+        DROP COLUMN id;
+    """)
+    
+    # Rename new_id to id
+    schema_editor.execute(f"""
+        ALTER TABLE {schema_editor.quote_name(table_name)} 
+        RENAME COLUMN new_id TO id;
+    """)
+    
+    # Add primary key constraint
+    schema_editor.execute(f"""
+        ALTER TABLE {schema_editor.quote_name(table_name)} 
+        ADD PRIMARY KEY (id);
+    """)
+    
+    # Make it NOT NULL
+    schema_editor.execute(f"""
+        ALTER TABLE {schema_editor.quote_name(table_name)} 
+        ALTER COLUMN id SET NOT NULL;
+    """)
+    
+    # Remove default (we'll use Django's default in the model)
+    schema_editor.execute(f"""
+        ALTER TABLE {schema_editor.quote_name(table_name)} 
+        ALTER COLUMN id DROP DEFAULT;
+    """)
+
+
+def reverse_convert_password_reset_token_id(apps, schema_editor):
+    """
+    Reverse the conversion (for rollback purposes).
+    Note: This is complex and may not be fully reversible if there are foreign keys.
+    """
+    # This is a one-way migration in practice
+    # If rollback is needed, it would require recreating the table
+    pass
+
+
 class Migration(migrations.Migration):
 
     dependencies = [
@@ -44,10 +127,22 @@ class Migration(migrations.Migration):
             field=models.CharField(db_index=True, default=1, max_length=64, unique=True),
             preserve_default=False,
         ),
-        migrations.AlterField(
-            model_name='zkpasswordresettoken',
-            name='id',
-            field=models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False),
+        # Custom migration to convert id from bigint to UUID
+        # Use SeparateDatabaseAndState to update only the state without generating SQL
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.RunPython(
+                    convert_password_reset_token_id_to_uuid,
+                    reverse_convert_password_reset_token_id,
+                ),
+            ],
+            state_operations=[
+                migrations.AlterField(
+                    model_name='zkpasswordresettoken',
+                    name='id',
+                    field=models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False),
+                ),
+            ],
         ),
         migrations.AddIndex(
             model_name='zkuser',

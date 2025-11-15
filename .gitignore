@@ -1,2 +1,10 @@
+# Environment files - keep secrets out of version control
 .env
+.env.local
+.env.production
+
+# Python virtual environment
 venv/*
+
+# Django static files (generated)
+staticfiles/
