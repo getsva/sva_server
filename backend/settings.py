@@ -111,7 +111,7 @@ MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'corsheaders.middleware.CorsMiddleware',
-    'django.middleware.common.CommonMiddleware',
+    'backend.middleware.HealthCheckCommonMiddleware',  # Custom middleware to prevent redirect loops
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
@@ -172,6 +172,11 @@ LANGUAGE_CODE = 'en-us'
 TIME_ZONE = 'UTC'
 USE_I18N = True
 USE_TZ = True
+
+# --- URL Configuration ---
+# Disable APPEND_SLASH for root health check endpoint to prevent redirect loops
+# on Azure App Service and other platforms
+APPEND_SLASH = True  # Keep enabled for other endpoints, but root path handles both
 
 # --- Static files ---
 STATIC_URL = 'static/'

@@ -5,6 +5,8 @@ from django.urls import path, include
 from .views import HealthCheckView
 
 urlpatterns = [
+    # Health check endpoint at root
+    # Using path('') handles both / and // to prevent redirect loops on Azure App Service
     path('', HealthCheckView.as_view(), name='health_check'),
     path('admin/', admin.site.urls),
     path('api/auth/', include('authentication.urls'),name='authentication'),
