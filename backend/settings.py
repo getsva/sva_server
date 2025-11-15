@@ -124,6 +124,12 @@ MIDDLEWARE = [
 
 # --- Security Settings (Production) ---
 if IS_PRODUCTION:
+    # CRITICAL: Tell Django to trust Azure App Service's reverse proxy headers
+    # Azure App Service sits behind a reverse proxy, and Django needs to know
+    # that requests are already HTTPS by checking the X-Forwarded-Proto header.
+    # Without this, SECURE_SSL_REDIRECT will cause infinite redirect loops.
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    
     # Security settings for production
     SECURE_SSL_REDIRECT = env('SECURE_SSL_REDIRECT', default=True, cast=bool)
     SESSION_COOKIE_SECURE = True
