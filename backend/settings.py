@@ -113,6 +113,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',  # Serve static files efficiently in production
     'django.contrib.sessions.middleware.SessionMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'backend.middleware.HealthCheckCommonMiddleware',  # Custom middleware to prevent redirect loops
@@ -189,8 +190,13 @@ USE_TZ = True
 APPEND_SLASH = True  # Keep enabled for other endpoints, but root path handles both
 
 # --- Static files ---
-STATIC_URL = 'static/'
+STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+# WhiteNoise configuration for serving static files in production
+# WhiteNoise allows your Django app to serve its own static files efficiently
+STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 
