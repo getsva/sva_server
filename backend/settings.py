@@ -162,13 +162,25 @@ TEMPLATES = [
 WSGI_APPLICATION = 'backend.wsgi.application'
 
 # --- Database ---
-DATABASES = {
-    'default': dj_database_url.config(
-        default=env('DATABASE_URL'),
-        conn_max_age=600,
-        ssl_require=env('DB_SSL_REQUIRE', default=False, cast=bool)
-    )
-}
+# Use a default SQLite database if DATABASE_URL is not set (useful for collectstatic, migrations, etc.)
+# In production, DATABASE_URL should always be set
+database_url = env('DATABASE_URL', default='')
+if database_url:
+    DATABASES = {
+        'default': dj_database_url.config(
+            default=database_url,
+            conn_max_age=600,
+            ssl_require=env('DB_SSL_REQUIRE', default=False, cast=bool)
+        )
+    }
+else:
+    # Fallback to SQLite for development or when DATABASE_URL is not set (e.g., during collectstatic)
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
 
 # --- Password Validation ---
 AUTH_PASSWORD_VALIDATORS = [
