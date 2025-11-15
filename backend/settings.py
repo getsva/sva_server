@@ -86,6 +86,10 @@ else:
 if IS_PRODUCTION:
     DEBUG = False
 
+# ALLOWED_HOSTS - must include your Azure App Service domain
+# For Azure App Service, you MUST set this in environment variables:
+# ALLOWED_HOSTS=sva-server.azurewebsites.net,api.getsva.com
+# Or set it in Azure Portal > Configuration > Application Settings
 ALLOWED_HOSTS = env.list('ALLOWED_HOSTS', default=['127.0.0.1', 'localhost'])
 
 # --- Application Definitions ---
