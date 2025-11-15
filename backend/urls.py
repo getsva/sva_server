@@ -3,6 +3,8 @@
 from django.contrib import admin
 from django.urls import path, include
 from .views import HealthCheckView
+from django.conf import settings
+from django.conf.urls.static import static
 
 urlpatterns = [
     # Health check endpoints
@@ -17,3 +19,6 @@ urlpatterns = [
     path('api/setting/', include('svasetting.urls'),name='svasetting'),
     path('api/canvas/', include('identity_canvas.urls'),name='identity_canvas'),
 ]
+
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

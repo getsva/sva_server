@@ -192,6 +192,8 @@ APPEND_SLASH = True  # Keep enabled for other endpoints, but root path handles b
 # --- Static files ---
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
 
 # WhiteNoise configuration for serving static files in production
 # WhiteNoise allows your Django app to serve its own static files efficiently
