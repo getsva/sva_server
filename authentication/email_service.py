@@ -102,7 +102,7 @@ class SVAEmailTemplate:
                                 <td class="header-cell" align="center" style="padding: 50px 40px; color: #ffffff; background-color: #008080; background: linear-gradient(135deg, #20c997 0%, #17a589 50%, #008080 100%);">
                                     <img src="https://getsva.com/assets/logo_light-CdL5_O1L.png" alt="SVA Logo" width="120" style="display: block; margin: 0 auto 24px auto; border-radius: 20px;">
                                     <h1 class="header-title" style="font-family: 'Inter', Arial, sans-serif; font-size: 32px; font-weight: 800; margin: 0 0 12px; color: #ffffff;">{header_title}</h1>
-                                    <p style="font-family: 'Inter', Arial, sans-serif; font-size: 8px; font-weight: 500; margin: 0; color: #ffffff; opacity: 0.95;">{header_subtitle}</p>
+                                    <p style="font-family: 'Inter', Arial, sans-serif; font-size: 16px; font-weight: 500; margin: 0; color: #ffffff; opacity: 0.95;">{header_subtitle}</p>
                                 </td>
                             </tr>
 
@@ -154,8 +154,9 @@ class SVAEmailTemplate:
 
 
 def send_verification_email(email, token, frontend_url=None):
+    # Use frontend_url from parameter, or fall back to Django settings, or localhost as last resort
     if not frontend_url:
-        frontend_url = "http://localhost:8080"
+        frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')
     
     verification_url = f"{frontend_url}/verify-email?token={token}"
     subject = "Verify Your Email - SVA Zero-Knowledge Authentication"
@@ -300,8 +301,9 @@ def send_welcome_email(email, user_id):
 
 
 def send_password_reset_email(email, token, frontend_url=None):
+    # Use frontend_url from parameter, or fall back to Django settings, or localhost as last resort
     if not frontend_url:
-        frontend_url = "http://localhost:8080"
+        frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')
     
     reset_url = f"{frontend_url}/reset-password?token={token}"
     subject = "Reset Your Password - SVA Security"
@@ -381,8 +383,9 @@ def send_otp_email(email, otp_code, frontend_url=None):
     Send OTP code via email for verifiable block verification
     Zero-Knowledge: Email is only used temporarily to send OTP, never stored long-term
     """
+    # Use frontend_url from parameter, or fall back to Django settings, or localhost as last resort
     if not frontend_url:
-        frontend_url = "http://localhost:8080"
+        frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')
     
     subject = "Your SVA Verification Code"
     
@@ -497,8 +500,9 @@ def send_otp_sms(phone_number, otp_code):
 
 
 def send_account_locked_email(email, unlock_token, frontend_url=None):
+    # Use frontend_url from parameter, or fall back to Django settings, or localhost as last resort
     if not frontend_url:
-        frontend_url = "http://localhost:8080"
+        frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')
     
     unlock_url = f"{frontend_url}/unlock-account?token={unlock_token}"
     subject = "Account Security Alert - SVA"

@@ -257,6 +257,15 @@ DATA_TOKEN_ISSUER = env('DATA_TOKEN_ISSUER', default='sva_core')
 INTERNAL_SERVICE_TIMEOUT = env.int('INTERNAL_SERVICE_TIMEOUT', default=5)
 
 
+# --- Frontend URL Configuration ---
+# This is used in email links (verification, password reset, etc.)
+# Set this in your environment variables for production
+if IS_DEVELOPMENT:
+    FRONTEND_URL = env('FRONTEND_URL', default='http://localhost:8080')
+else:
+    # Production: use environment variable or default to getsva.com
+    FRONTEND_URL = env('FRONTEND_URL', default='https://getsva.com')
+
 # --- Email Settings for Password Reset ---
 # Auto-configure email backend based on environment
 EMAIL_BACKEND_TYPE = env('EMAIL_BACKEND', default='smtp' if IS_PRODUCTION else 'console').lower()
