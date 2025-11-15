@@ -2,8 +2,10 @@
 
 from django.contrib import admin
 from django.urls import path, include
+from .views import HealthCheckView
 
 urlpatterns = [
+    path('', HealthCheckView.as_view(), name='health_check'),
     path('admin/', admin.site.urls),
     path('api/auth/', include('authentication.urls'),name='authentication'),
     path('api/internal/', include('authentication.internal_urls'), name='authentication_internal'),
