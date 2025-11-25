@@ -17,7 +17,8 @@ urlpatterns = [
     path('api/auth/', include('authentication.urls'),name='authentication'),
     path('api/internal/', include('authentication.internal_urls'), name='authentication_internal'),
     path('api/setting/', include('svasetting.urls'),name='svasetting'),
-    path('api/canvas/', include('identity_canvas.urls'),name='identity_canvas'),
+    path('api/canvas/', include('identity_canvas.urls'), name='identity_canvas'),
+    path('api/verifications/', include('verifications.urls'), name='verifications'),
 ]
 
 if settings.DEBUG:

@@ -96,3 +96,18 @@ Based on `ENVIRONMENT`, these settings are automatically configured:
 - `DEBUG` - True for development, False for production
 - `EMAIL_BACKEND` - Console for development, SMTP for production
 - Security settings - Production security enabled when `ENVIRONMENT=production`
+
+## Sandbox Verification Settings
+
+The new verification service integrates with Sandbox (https://developer.sandbox.co.in/) for PAN/Aadhaar/GST checks.
+Configure these variables in your `.env` file when you are ready to connect a real Sandbox account:
+
+```
+SANDBOX_API_BASE_URL=https://api.sandbox.co.in
+SANDBOX_API_KEY=your-sandbox-api-key
+SANDBOX_VERIFICATION_ENDPOINT=/kyc/verify
+SANDBOX_API_TIMEOUT=30
+```
+
+If these variables are left empty (default), the backend will simulate successful verifications so that local
+development continues to work without real API keys.
