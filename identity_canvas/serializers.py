@@ -2,6 +2,8 @@ from rest_framework import serializers
 from .models import (
     IdentityCanvas,
     CanvasHistory,
+    VerificationCanvas,
+    VerificationCanvasHistory,
     UsernameProof,
 )
 import hashlib
@@ -54,6 +56,59 @@ class CanvasHistorySerializer(serializers.ModelSerializer):
     
     class Meta:
         model = CanvasHistory
+        fields = [
+            'id',
+            'encrypted_blocks_snapshot',
+            'version',
+            'action',
+            'created_at'
+        ]
+        read_only_fields = fields
+
+
+class VerificationCanvasSerializer(serializers.ModelSerializer):
+    """Serializer for Verification Canvas"""
+
+    class Meta:
+        model = VerificationCanvas
+        fields = [
+            'id',
+            'encrypted_blocks',
+            'created_at',
+            'updated_at',
+            'version'
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at', 'version']
+
+
+class CreateVerificationCanvasSerializer(serializers.Serializer):
+    encrypted_blocks = serializers.CharField(required=True)
+
+    def validate_encrypted_blocks(self, value):
+        if not value or len(value) < 10:
+            raise serializers.ValidationError("Invalid encrypted data")
+        return value
+
+
+class UpdateVerificationCanvasSerializer(serializers.Serializer):
+    encrypted_blocks = serializers.CharField(required=True)
+    version = serializers.IntegerField(required=False)
+    create_history = serializers.BooleanField(default=False, required=False)
+
+    def validate_encrypted_blocks(self, value):
+        if not value or len(value) < 10:
+            raise serializers.ValidationError("Invalid encrypted data")
+        return value
+
+    def validate_version(self, value):
+        if value is not None and value < 1:
+            raise serializers.ValidationError("Version must be positive")
+        return value
+
+
+class VerificationCanvasHistorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = VerificationCanvasHistory
         fields = [
             'id',
             'encrypted_blocks_snapshot',

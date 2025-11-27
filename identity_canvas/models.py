@@ -90,6 +90,69 @@ class CanvasHistory(models.Model):
         return f"Canvas {self.canvas.id} - Version {self.version}"
 
 
+class VerificationCanvas(models.Model):
+    """
+    Stores encrypted verification blocks (separate from identity canvas).
+    Each user has one verification canvas mirroring the identity canvas lifecycle.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.OneToOneField(
+        ZKUser,
+        on_delete=models.CASCADE,
+        related_name='verification_canvas'
+    )
+
+    encrypted_blocks = models.TextField(
+        help_text="Encrypted JSON array of verification blocks"
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    version = models.IntegerField(default=1)
+
+    class Meta:
+        db_table = 'verification_canvas'
+        verbose_name = 'Verification Canvas'
+        verbose_name_plural = 'Verification Canvases'
+        ordering = ['-updated_at']
+
+    def __str__(self):
+        return f"Verification Canvas for {self.user.id}"
+
+
+class VerificationCanvasHistory(models.Model):
+    """
+    Optional history table for verification canvas updates (audit trail).
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    canvas = models.ForeignKey(
+        VerificationCanvas,
+        on_delete=models.CASCADE,
+        related_name='history'
+    )
+    encrypted_blocks_snapshot = models.TextField()
+    version = models.IntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    action = models.CharField(
+        max_length=50,
+        blank=True,
+        null=True,
+        help_text="Action that created this version (create, update, delete)"
+    )
+
+    class Meta:
+        db_table = 'verification_canvas_history'
+        verbose_name = 'Verification Canvas History'
+        verbose_name_plural = 'Verification Canvas Histories'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['canvas', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f"Verification Canvas {self.canvas.id} - Version {self.version}"
+
+
 # ==================== VERIFICATION SYSTEM (Zero-Knowledge OTP) ====================
 
 class VerificationBlockType(models.TextChoices):

@@ -1,102 +1,61 @@
 from rest_framework import serializers
 
-from identity_canvas.models import (
-    DocumentVerification,
-    VerifiableBlockOTP,
-    VerifiedBlock,
-    VerificationBlockType,
-)
+from identity_canvas.models import VerificationBlockType, DocumentVerification
 
 
 class RequestOTPSerializer(serializers.Serializer):
-    block_type = serializers.ChoiceField(
-        choices=VerificationBlockType.choices,
-        required=True,
-        help_text="Type of block to verify (email, phone, etc.)",
+    block_type = serializers.ChoiceField(choices=VerificationBlockType.choices)
+    value = serializers.CharField(max_length=512)
+    delivery_method = serializers.ChoiceField(
+        choices=[("email", "Email"), ("sms", "SMS")],
+        required=False,
+        allow_null=True,
+        allow_blank=True,
     )
-    value = serializers.CharField(
-        required=True,
-        help_text="Value to verify (email, phone, etc.) - will be hashed client-side ideally, but we receive it to send OTP",
-    )
-
-    def validate_block_type(self, value):
-        if value not in [choice[0] for choice in VerificationBlockType.choices]:
-            raise serializers.ValidationError(f"Unsupported block type: {value}")
-        return value
-
-    def validate_value(self, value):
-        if not value or len(value.strip()) == 0:
-            raise serializers.ValidationError("Value cannot be empty")
-        return value.strip()
+    frontend_url = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
 
 class VerifyOTPSerializer(serializers.Serializer):
-    block_type = serializers.ChoiceField(
-        choices=VerificationBlockType.choices,
-        required=True,
-        help_text="Type of block being verified",
-    )
-    value_hash = serializers.CharField(
-        required=True,
-        max_length=64,
-        help_text="SHA-256 hash of the value being verified (zero-knowledge)",
-    )
-    otp_code = serializers.CharField(
-        required=True,
-        max_length=6,
-        min_length=6,
-        help_text="6-digit OTP code",
-    )
-
-    def validate_otp_code(self, value):
-        if not value.isdigit():
-            raise serializers.ValidationError("OTP code must be numeric")
-        if len(value) != 6:
-            raise serializers.ValidationError("OTP code must be 6 digits")
-        return value
+    block_type = serializers.ChoiceField(choices=VerificationBlockType.choices)
+    value_hash = serializers.CharField(max_length=64)
+    otp_code = serializers.CharField(min_length=4, max_length=6)
 
     def validate_value_hash(self, value):
         if len(value) != 64:
-            raise serializers.ValidationError("Hash must be 64 characters (SHA-256)")
-        return value
+            raise serializers.ValidationError("value_hash must be a SHA-256 hex string.")
+        return value.lower()
 
 
 class CheckVerificationStatusSerializer(serializers.Serializer):
-    block_type = serializers.ChoiceField(choices=VerificationBlockType.choices, required=True)
-    value_hash = serializers.CharField(required=True, max_length=64)
+    block_type = serializers.ChoiceField(choices=VerificationBlockType.choices)
+    value_hash = serializers.CharField(max_length=64)
 
     def validate_value_hash(self, value):
         if len(value) != 64:
-            raise serializers.ValidationError("Hash must be 64 characters (SHA-256)")
-        return value
+            raise serializers.ValidationError("value_hash must be a SHA-256 hex string.")
+        return value.lower()
 
 
-class VerifiableBlockOTPSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = VerifiableBlockOTP
-        fields = [
-            "id",
-            "block_type",
-            "expires_at",
-            "is_verified",
-            "attempts",
-            "max_attempts",
-            "created_at",
+class DocumentVerificationRequestSerializer(serializers.Serializer):
+    block_type = serializers.ChoiceField(choices=VerificationBlockType.choices)
+    document_identifier = serializers.CharField(max_length=512)
+    verification_method = serializers.ChoiceField(
+        choices=[
+            ("manual_upload", "Manual Upload"),
+            ("third_party", "Third Party API"),
+            ("institutional", "Institutional Verification"),
         ]
-        read_only_fields = fields
+    )
+    additional_data = serializers.JSONField(required=False)
 
 
-class VerifiedBlockSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = VerifiedBlock
-        fields = [
-            "id",
-            "block_type",
-            "value_hash",
-            "verified_at",
-            "verification_method",
-        ]
-        read_only_fields = fields
+class DocumentVerificationVerifySerializer(serializers.Serializer):
+    verification_id = serializers.UUIDField()
+    verification_code = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+
+class DocumentVerificationStatusSerializer(serializers.Serializer):
+    verification_id = serializers.UUIDField()
 
 
 class DocumentVerificationSerializer(serializers.ModelSerializer):
@@ -110,41 +69,7 @@ class DocumentVerificationSerializer(serializers.ModelSerializer):
             "status",
             "created_at",
             "verified_at",
+            "verification_metadata",
         ]
-        read_only_fields = ["id", "created_at", "verified_at"]
-
-
-class RequestDocumentVerificationSerializer(serializers.Serializer):
-    block_type = serializers.ChoiceField(
-        choices=VerificationBlockType.choices,
-        required=True,
-    )
-    document_identifier = serializers.CharField(
-        required=True,
-        help_text="Document identifier (e.g., PAN number, license number) - will be hashed",
-    )
-    verification_method = serializers.ChoiceField(
-        choices=DocumentVerification.VERIFICATION_METHOD_CHOICES,
-        required=True,
-    )
-    additional_data = serializers.DictField(
-        required=False,
-        help_text="Additional data for verification",
-    )
-
-    def validate_block_type(self, value):
-        otp_only_types = ["email", "phone"]
-        if value in otp_only_types:
-            raise serializers.ValidationError(
-                f"{value} verification uses OTP method, not document verification"
-            )
-        return value
-
-
-class VerifyDocumentSerializer(serializers.Serializer):
-    verification_id = serializers.UUIDField(required=True)
-    verification_code = serializers.CharField(
-        required=False,
-        help_text="Verification code if needed (e.g., from third-party callback)",
-    )
+        read_only_fields = fields
 

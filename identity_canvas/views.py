@@ -8,6 +8,8 @@ from django.db import transaction
 from .models import (
     IdentityCanvas,
     CanvasHistory,
+    VerificationCanvas,
+    VerificationCanvasHistory,
     UsernameProof,
 )
 from .serializers import (
@@ -15,6 +17,10 @@ from .serializers import (
     CreateCanvasSerializer,
     UpdateCanvasSerializer,
     CanvasHistorySerializer,
+    VerificationCanvasSerializer,
+    CreateVerificationCanvasSerializer,
+    UpdateVerificationCanvasSerializer,
+    VerificationCanvasHistorySerializer,
     CheckUsernamePrefixSerializer,
     RegisterUsernameSerializer,
 )
@@ -280,6 +286,216 @@ class RestoreCanvasVersionView(APIView):
         serializer = IdentityCanvasSerializer(canvas)
         return Response({
             'message': f'Canvas restored to version {history_entry.version}',
+            'canvas': serializer.data
+        })
+
+
+class GetVerificationCanvasView(APIView):
+    """Get user's verification canvas (separate from identity canvas)."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        try:
+            canvas = VerificationCanvas.objects.get(user=user)
+            serializer = VerificationCanvasSerializer(canvas)
+            return Response(serializer.data)
+        except VerificationCanvas.DoesNotExist:
+            return Response({
+                'id': None,
+                'encrypted_blocks': '',
+                'created_at': None,
+                'updated_at': None,
+                'version': 0
+            })
+
+
+class CreateVerificationCanvasView(APIView):
+    """Create a verification canvas for the user."""
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request):
+        serializer = CreateVerificationCanvasSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        user = request.user
+        if VerificationCanvas.objects.filter(user=user).exists():
+            return Response(
+                {'error': 'Verification canvas already exists. Use update endpoint.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        canvas = VerificationCanvas.objects.create(
+            user=user,
+            encrypted_blocks=serializer.validated_data['encrypted_blocks']
+        )
+        VerificationCanvasHistory.objects.create(
+            canvas=canvas,
+            encrypted_blocks_snapshot=canvas.encrypted_blocks,
+            version=1,
+            action='create'
+        )
+        response_serializer = VerificationCanvasSerializer(canvas)
+        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+
+
+class UpdateVerificationCanvasView(APIView):
+    """Update verification canvas with optimistic locking support."""
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def patch(self, request):
+        serializer = UpdateVerificationCanvasSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        user = request.user
+        try:
+            canvas = VerificationCanvas.objects.get(user=user)
+        except VerificationCanvas.DoesNotExist:
+            canvas = VerificationCanvas.objects.create(
+                user=user,
+                encrypted_blocks=serializer.validated_data['encrypted_blocks']
+            )
+            VerificationCanvasHistory.objects.create(
+                canvas=canvas,
+                encrypted_blocks_snapshot=canvas.encrypted_blocks,
+                version=1,
+                action='create'
+            )
+            response_serializer = VerificationCanvasSerializer(canvas)
+            return Response(response_serializer.data)
+
+        requested_version = serializer.validated_data.get('version')
+        if requested_version is not None and canvas.version != requested_version:
+            return Response(
+                {
+                    'error': 'Version conflict. Verification canvas was modified by another request.',
+                    'current_version': canvas.version
+                },
+                status=status.HTTP_409_CONFLICT
+            )
+
+        old_snapshot = canvas.encrypted_blocks
+        old_version = canvas.version
+
+        canvas.encrypted_blocks = serializer.validated_data['encrypted_blocks']
+        canvas.version += 1
+        canvas.save()
+
+        if serializer.validated_data.get('create_history', False):
+            VerificationCanvasHistory.objects.create(
+                canvas=canvas,
+                encrypted_blocks_snapshot=old_snapshot,
+                version=old_version,
+                action='update'
+            )
+
+        response_serializer = VerificationCanvasSerializer(canvas)
+        return Response(response_serializer.data)
+
+
+class DeleteVerificationCanvasView(APIView):
+    """Delete all verification canvas data for the user."""
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def delete(self, request):
+        user = request.user
+        try:
+            canvas = VerificationCanvas.objects.get(user=user)
+            canvas_id = canvas.id
+            VerificationCanvasHistory.objects.filter(canvas=canvas).delete()
+            canvas.delete()
+            return Response({
+                'message': 'Verification canvas deleted successfully',
+                'deleted_id': str(canvas_id)
+            })
+        except VerificationCanvas.DoesNotExist:
+            return Response(
+                {'error': 'Verification canvas not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+
+class GetVerificationCanvasHistoryView(APIView):
+    """List history entries for verification canvas."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        try:
+            canvas = VerificationCanvas.objects.get(user=user)
+        except VerificationCanvas.DoesNotExist:
+            return Response(
+                {'error': 'Verification canvas not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        limit = int(request.query_params.get('limit', 50))
+        offset = int(request.query_params.get('offset', 0))
+
+        history = VerificationCanvasHistory.objects.filter(canvas=canvas)[offset:offset + limit]
+        total_count = VerificationCanvasHistory.objects.filter(canvas=canvas).count()
+        serializer = VerificationCanvasHistorySerializer(history, many=True)
+        return Response({
+            'history': serializer.data,
+            'total': total_count,
+            'limit': limit,
+            'offset': offset
+        })
+
+
+class RestoreVerificationCanvasVersionView(APIView):
+    """Restore verification canvas from a history snapshot."""
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request):
+        user = request.user
+        version_id = request.data.get('version_id')
+        if not version_id:
+            return Response(
+                {'error': 'version_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            canvas = VerificationCanvas.objects.get(user=user)
+        except VerificationCanvas.DoesNotExist:
+            return Response(
+                {'error': 'Verification canvas not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        try:
+            history_entry = VerificationCanvasHistory.objects.get(
+                id=version_id,
+                canvas=canvas
+            )
+        except VerificationCanvasHistory.DoesNotExist:
+            return Response(
+                {'error': 'History version not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        old_snapshot = canvas.encrypted_blocks
+        old_version = canvas.version
+
+        canvas.encrypted_blocks = history_entry.encrypted_blocks_snapshot
+        canvas.version += 1
+        canvas.save()
+
+        VerificationCanvasHistory.objects.create(
+            canvas=canvas,
+            encrypted_blocks_snapshot=old_snapshot,
+            version=old_version,
+            action=f'restore_from_v{history_entry.version}'
+        )
+
+        serializer = VerificationCanvasSerializer(canvas)
+        return Response({
+            'message': f'Verification canvas restored to version {history_entry.version}',
             'canvas': serializer.data
         })
 

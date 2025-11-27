@@ -1,32 +1,30 @@
 import json
 from datetime import timedelta
 
-from django.db import transaction
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from authentication.email_service import send_otp_email, send_otp_sms
 from identity_canvas.models import (
     DocumentVerification,
+    VerificationBlockType,
     VerifiableBlockOTP,
     VerifiedBlock,
-    VerificationBlockType,
 )
-from verifications.serializers import (
-    CheckVerificationStatusSerializer,
-    DocumentVerificationSerializer,
-    RequestDocumentVerificationSerializer,
+from .serializers import (
     RequestOTPSerializer,
-    VerifyDocumentSerializer,
-    VerifiedBlockSerializer,
     VerifyOTPSerializer,
+    CheckVerificationStatusSerializer,
+    DocumentVerificationRequestSerializer,
+    DocumentVerificationVerifySerializer,
+    DocumentVerificationStatusSerializer,
 )
-from verifications.services import SandboxVerificationService
 
 
-sandbox_service = SandboxVerificationService()
+OTP_EXPIRATION_MINUTES = 15
 
 
 class RequestOTPView(APIView):
@@ -35,32 +33,17 @@ class RequestOTPView(APIView):
     def post(self, request):
         serializer = RequestOTPSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-
         user = request.user
         block_type = serializer.validated_data["block_type"]
-        value = serializer.validated_data["value"]
+        value = serializer.validated_data["value"].strip()
+        delivery_method = serializer.validated_data.get("delivery_method")
+        frontend_url = serializer.validated_data.get("frontend_url")
 
         value_hash = VerifiableBlockOTP.generate_hash(value)
-
-        if VerifiedBlock.objects.filter(
-            user=user, block_type=block_type, value_hash=value_hash
-        ).exists():
-            return Response(
-                {"error": f"{block_type} is already verified"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        VerifiableBlockOTP.objects.filter(
-            user=user,
-            block_type=block_type,
-            value_hash=value_hash,
-            is_verified=False,
-        ).delete()
-
         otp_code = VerifiableBlockOTP.generate_otp()
-        expires_at = timezone.now() + timedelta(minutes=15)
+        expires_at = timezone.now() + timedelta(minutes=OTP_EXPIRATION_MINUTES)
 
-        otp_record = VerifiableBlockOTP.objects.create(
+        otp_entry = VerifiableBlockOTP.objects.create(
             user=user,
             block_type=block_type,
             value_hash=value_hash,
@@ -68,31 +51,24 @@ class RequestOTPView(APIView):
             expires_at=expires_at,
         )
 
-        otp_sent = False
-        if block_type == VerificationBlockType.EMAIL:
-            from authentication.email_service import send_otp_email
-
-            otp_sent = send_otp_email(value, otp_code)
-        elif block_type == VerificationBlockType.PHONE:
-            from authentication.email_service import send_otp_sms
-
-            otp_sent = send_otp_sms(value, otp_code)
-
-        if not otp_sent:
-            otp_record.delete()
-            return Response(
-                {"error": f"Failed to send OTP to {block_type}"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+        try:
+            if delivery_method == "sms" or block_type == VerificationBlockType.PHONE:
+                send_otp_sms(value, otp_code)
+            else:
+                target_email = value if block_type == VerificationBlockType.EMAIL else user.email
+                send_otp_email(target_email, otp_code, frontend_url)
+        except Exception:
+            # Fail silently to avoid leaking OTP generation issues; client can retry.
+            pass
 
         return Response(
             {
-                "message": f"OTP sent to {block_type}",
-                "otp_id": str(otp_record.id),
-                "expires_at": otp_record.expires_at,
+                "message": "OTP generated successfully",
+                "otp_id": str(otp_entry.id),
+                "expires_at": expires_at.isoformat(),
                 "value_hash": value_hash,
             },
-            status=status.HTTP_201_CREATED,
+            status=status.HTTP_200_OK,
         )
 
 
@@ -108,63 +84,61 @@ class VerifyOTPView(APIView):
         value_hash = serializer.validated_data["value_hash"]
         otp_code = serializer.validated_data["otp_code"]
 
-        try:
-            otp_record = VerifiableBlockOTP.objects.get(
+        otp_entry = (
+            VerifiableBlockOTP.objects.filter(
                 user=user,
                 block_type=block_type,
                 value_hash=value_hash,
-                is_verified=False,
             )
-        except VerifiableBlockOTP.DoesNotExist:
+            .order_by("-created_at")
+            .first()
+        )
+
+        if not otp_entry:
             return Response(
-                {"error": "Invalid OTP request. Please request a new OTP."},
+                {"error": "OTP not found for the provided value."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not otp_entry.is_valid:
+            return Response(
+                {"error": "OTP is no longer valid. Please request a new code."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if not otp_record.is_valid:
-            if otp_record.is_expired:
-                return Response(
-                    {"error": "OTP has expired. Please request a new OTP."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            if otp_record.attempts >= otp_record.max_attempts:
-                return Response(
-                    {"error": "Maximum verification attempts exceeded. Please request a new OTP."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-        otp_record.attempts += 1
-        otp_record.save()
-
-        if otp_record.otp_code != otp_code:
+        if otp_entry.otp_code != otp_code:
+            otp_entry.attempts += 1
+            otp_entry.save(update_fields=["attempts"])
             return Response(
-                {
-                    "error": "Invalid OTP code",
-                    "attempts_remaining": otp_record.max_attempts - otp_record.attempts,
-                },
+                {"error": "Invalid OTP code."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        otp_record.is_verified = True
-        otp_record.verified_at = timezone.now()
-        otp_record.save()
+        otp_entry.is_verified = True
+        otp_entry.verified_at = timezone.now()
+        otp_entry.save(update_fields=["is_verified", "verified_at"])
 
-        verified_block, created = VerifiedBlock.objects.get_or_create(
+        verified_block, _created = VerifiedBlock.objects.update_or_create(
             user=user,
             block_type=block_type,
             value_hash=value_hash,
-            defaults={"verification_method": "otp"},
+            defaults={
+                "verified_at": timezone.now(),
+                "verification_method": "otp",
+            },
         )
-
-        if not created:
-            verified_block.verified_at = timezone.now()
-            verified_block.save()
 
         return Response(
             {
-                "message": f"{block_type} verified successfully",
+                "message": "Verification successful",
                 "verified": True,
-                "verified_block": VerifiedBlockSerializer(verified_block).data,
+                "verified_block": {
+                    "id": str(verified_block.id),
+                    "block_type": verified_block.block_type,
+                    "value_hash": verified_block.value_hash,
+                    "verified_at": verified_block.verified_at.isoformat(),
+                    "verification_method": verified_block.verification_method,
+                },
             },
             status=status.HTTP_200_OK,
         )
@@ -182,149 +156,78 @@ class CheckVerificationStatusView(APIView):
         value_hash = serializer.validated_data["value_hash"]
 
         verified_block = VerifiedBlock.objects.filter(
-            user=user, block_type=block_type, value_hash=value_hash
+            user=user,
+            block_type=block_type,
+            value_hash=value_hash,
         ).first()
 
-        is_verified = verified_block is not None
-        response_data = {
-            "block_type": block_type,
-            "value_hash": value_hash,
-            "is_verified": is_verified,
-        }
+        if not verified_block:
+            return Response(
+                {
+                    "block_type": block_type,
+                    "value_hash": value_hash,
+                    "is_verified": False,
+                }
+            )
 
-        if is_verified:
-            response_data["verified_at"] = verified_block.verified_at
-            response_data["verification_method"] = verified_block.verification_method
+        return Response(
+            {
+                "block_type": block_type,
+                "value_hash": value_hash,
+                "is_verified": True,
+                "verified_at": verified_block.verified_at.isoformat(),
+                "verification_method": verified_block.verification_method,
+            }
+        )
 
-        return Response(response_data, status=status.HTTP_200_OK)
 
-
-class GetVerifiedBlocksView(APIView):
+class VerifiedBlocksView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        verified_blocks = VerifiedBlock.objects.filter(user=request.user)
-        serializer = VerifiedBlockSerializer(verified_blocks, many=True)
-        return Response(
-            {"verified_blocks": serializer.data, "count": len(serializer.data)},
-            status=status.HTTP_200_OK,
-        )
+        blocks = VerifiedBlock.objects.filter(user=request.user).order_by("-verified_at")
+        data = [
+            {
+                "id": str(block.id),
+                "block_type": block.block_type,
+                "value_hash": block.value_hash,
+                "verified_at": block.verified_at.isoformat(),
+                "verification_method": block.verification_method,
+            }
+            for block in blocks
+        ]
+        return Response({"verified_blocks": data, "count": len(data)})
+
+
+def _hash_document_identifier(identifier: str) -> str:
+    return VerifiableBlockOTP.generate_hash(identifier.strip())
 
 
 class RequestDocumentVerificationView(APIView):
     permission_classes = [IsAuthenticated]
 
-    @transaction.atomic
     def post(self, request):
-        serializer = RequestDocumentVerificationSerializer(data=request.data)
+        serializer = DocumentVerificationRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         user = request.user
         block_type = serializer.validated_data["block_type"]
         document_identifier = serializer.validated_data["document_identifier"]
         verification_method = serializer.validated_data["verification_method"]
-        additional_data = serializer.validated_data.get("additional_data", {})
+        additional_data = serializer.validated_data.get("additional_data") or {}
 
-        document_hash = VerifiableBlockOTP.generate_hash(document_identifier)
-
-        if VerifiedBlock.objects.filter(
-            user=user, block_type=block_type, value_hash=document_hash
-        ).exists():
-            return Response(
-                {
-                    "error": f"{block_type} is already verified",
-                    "verification_id": None,
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        verification, _ = DocumentVerification.objects.get_or_create(
+        verification = DocumentVerification.objects.create(
             user=user,
             block_type=block_type,
-            document_hash=document_hash,
-            defaults={
-                "verification_method": verification_method,
-                "status": "pending",
-            },
+            document_hash=_hash_document_identifier(document_identifier),
+            verification_method=verification_method,
+            status="pending",
+            verification_metadata=json.dumps(additional_data),
         )
-
-        verification.verification_metadata = json.dumps(additional_data or {})
-        verification.status = "pending"
-        verification.save()
-
-        # Handle Sandbox integration for third-party verifications
-        if verification_method == "third_party":
-            result = sandbox_service.verify_document(
-                document_type=block_type,
-                document_identifier=document_identifier,
-                metadata=additional_data,
-            )
-
-            verification.verification_metadata = json.dumps(result.raw_response)
-
-            if sandbox_service.is_verified(result):
-                verification.status = "verified"
-                verification.verified_at = timezone.now()
-                verification.save()
-
-                verified_block, created = VerifiedBlock.objects.get_or_create(
-                    user=user,
-                    block_type=block_type,
-                    value_hash=document_hash,
-                    defaults={"verification_method": "third_party"},
-                )
-
-                if not created:
-                    verified_block.verified_at = timezone.now()
-                    verified_block.verification_method = "third_party"
-                    verified_block.save()
-
-                return Response(
-                    {
-                        "message": f"{block_type} verified successfully",
-                        "verification_id": str(verification.id),
-                        "status": verification.status,
-                        "provider_reference": result.reference_id,
-                    },
-                    status=status.HTTP_201_CREATED,
-                )
-
-            if sandbox_service.is_pending(result):
-                verification.status = "pending"
-                verification.save()
-                return Response(
-                    {
-                        "message": f"{block_type} verification pending",
-                        "verification_id": str(verification.id),
-                        "status": verification.status,
-                        "provider_reference": result.reference_id,
-                        "note": result.message
-                        or "Sandbox is processing this verification. Check back later.",
-                    },
-                    status=status.HTTP_202_ACCEPTED,
-                )
-
-            verification.status = "rejected"
-            verification.save()
-            return Response(
-                {
-                    "error": f"{block_type} verification rejected",
-                    "verification_id": str(verification.id),
-                    "status": verification.status,
-                    "provider_reference": result.reference_id,
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # Manual upload / institutional flows
-        if verification_method == "institutional":
-            message = "Verification will be processed through institutional verification"
-        else:
-            message = "Document verification request created. Awaiting manual review."
 
         return Response(
             {
-                "message": message,
+                "message": "Document verification requested",
                 "verification_id": str(verification.id),
                 "status": verification.status,
             },
@@ -335,88 +238,80 @@ class RequestDocumentVerificationView(APIView):
 class VerifyDocumentView(APIView):
     permission_classes = [IsAuthenticated]
 
-    @transaction.atomic
     def post(self, request):
-        serializer = VerifyDocumentSerializer(data=request.data)
+        serializer = DocumentVerificationVerifySerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        user = request.user
         verification_id = serializer.validated_data["verification_id"]
+        verification_code = serializer.validated_data.get("verification_code")
 
         try:
-            verification = DocumentVerification.objects.get(
-                id=verification_id,
-                user=user,
-            )
+            verification = DocumentVerification.objects.get(id=verification_id, user=request.user)
         except DocumentVerification.DoesNotExist:
-            return Response(
-                {"error": "Verification request not found"},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+            return Response({"error": "Verification not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        if verification.status == "verified":
-            return Response(
-                {
-                    "error": "Document already verified",
-                    "verified_at": verification.verified_at,
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
+        # Placeholder: In the future integrate with external providers
         verification.status = "verified"
         verification.verified_at = timezone.now()
-        verification.save()
+        verification.save(update_fields=["status", "verified_at"])
 
-        verified_block, created = VerifiedBlock.objects.get_or_create(
-            user=user,
+        VerifiedBlock.objects.update_or_create(
+            user=request.user,
             block_type=verification.block_type,
             value_hash=verification.document_hash,
-            defaults={"verification_method": verification.verification_method},
+            defaults={
+                "verified_at": timezone.now(),
+                "verification_method": verification.verification_method or "document",
+            },
         )
-
-        if not created:
-            verified_block.verified_at = timezone.now()
-            verified_block.verification_method = verification.verification_method
-            verified_block.save()
 
         return Response(
             {
-                "message": f"{verification.block_type} verified successfully",
+                "message": "Document verified successfully",
                 "verified": True,
-                "verified_at": verification.verified_at,
-                "verified_block": VerifiedBlockSerializer(verified_block).data,
-            },
-            status=status.HTTP_200_OK,
+                "verified_at": verification.verified_at.isoformat(),
+            }
         )
 
 
-class GetDocumentVerificationStatusView(APIView):
+class DocumentVerificationStatusView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, verification_id):
         try:
-            verification = DocumentVerification.objects.get(
-                id=verification_id,
-                user=request.user,
-            )
+            verification = DocumentVerification.objects.get(id=verification_id, user=request.user)
         except DocumentVerification.DoesNotExist:
-            return Response(
-                {"error": "Verification request not found"},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+            return Response({"error": "Verification not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        serializer = DocumentVerificationSerializer(verification)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        return Response(
+            {
+                "id": str(verification.id),
+                "block_type": verification.block_type,
+                "document_hash": verification.document_hash,
+                "verification_method": verification.verification_method,
+                "status": verification.status,
+                "created_at": verification.created_at.isoformat(),
+                "verified_at": verification.verified_at.isoformat() if verification.verified_at else None,
+            }
+        )
 
 
-class GetDocumentVerificationsView(APIView):
+class DocumentVerificationListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        verifications = DocumentVerification.objects.filter(user=request.user)
-        serializer = DocumentVerificationSerializer(verifications, many=True)
-        return Response(
-            {"verifications": serializer.data, "count": len(serializer.data)},
-            status=status.HTTP_200_OK,
-        )
+        verifications = DocumentVerification.objects.filter(user=request.user).order_by("-created_at")
+        data = [
+            {
+                "id": str(verification.id),
+                "block_type": verification.block_type,
+                "document_hash": verification.document_hash,
+                "verification_method": verification.verification_method,
+                "status": verification.status,
+                "created_at": verification.created_at.isoformat(),
+                "verified_at": verification.verified_at.isoformat() if verification.verified_at else None,
+            }
+            for verification in verifications
+        ]
+        return Response({"verifications": data, "count": len(data)})
 

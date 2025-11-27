@@ -6,6 +6,12 @@ from .views import (
     DeleteCanvasView,
     GetCanvasHistoryView,
     RestoreCanvasVersionView,
+    GetVerificationCanvasView,
+    CreateVerificationCanvasView,
+    UpdateVerificationCanvasView,
+    DeleteVerificationCanvasView,
+    GetVerificationCanvasHistoryView,
+    RestoreVerificationCanvasVersionView,
     CheckUsernamePrefixView,
     RegisterUsernameView,
     UpdateUsernameView,
@@ -28,6 +34,14 @@ urlpatterns = [
     # History
     path('canvas/history/', GetCanvasHistoryView.as_view(), name='get_history'),
     path('canvas/restore/', RestoreCanvasVersionView.as_view(), name='restore_version'),
+
+    # Verification canvas endpoints
+    path('verification-canvas/', GetVerificationCanvasView.as_view(), name='get_verification_canvas'),
+    path('verification-canvas/create/', CreateVerificationCanvasView.as_view(), name='create_verification_canvas'),
+    path('verification-canvas/update/', UpdateVerificationCanvasView.as_view(), name='update_verification_canvas'),
+    path('verification-canvas/delete/', DeleteVerificationCanvasView.as_view(), name='delete_verification_canvas'),
+    path('verification-canvas/history/', GetVerificationCanvasHistoryView.as_view(), name='get_verification_history'),
+    path('verification-canvas/restore/', RestoreVerificationCanvasVersionView.as_view(), name='restore_verification_version'),
     
     # Username Uniqueness (Zero-Knowledge)
     path('username/check-prefix/', CheckUsernamePrefixView.as_view(), name='check_username_prefix'),
