@@ -3,7 +3,9 @@ from .models import (
     IdentityCanvas, 
     CanvasHistory, 
     VerifiableBlockOTP, 
-    VerifiedBlock,UsernameProof
+    VerifiedBlock,
+    UsernameProof,
+    AadhaarVerificationSession,
 )
 
 
@@ -54,3 +56,11 @@ class UsernameProofAdmin(admin.ModelAdmin):
     list_filter = ['created_at', 'updated_at']
     readonly_fields = ['id', 'proof_hash', 'prefix', 'username_hash', 'created_at', 'updated_at']
     search_fields = ['user__id', 'proof_hash', 'prefix', 'username_hash']
+
+
+@admin.register(AadhaarVerificationSession)
+class AadhaarVerificationSessionAdmin(admin.ModelAdmin):
+    list_display = ['reference_id', 'user', 'status', 'sandbox_message', 'created_at', 'verified_at']
+    list_filter = ['status', 'created_at']
+    readonly_fields = ['reference_id', 'aadhaar_hash', 'sandbox_transaction_id', 'sandbox_message', 'sandbox_metadata', 'simulated_otp', 'created_at', 'updated_at', 'verified_at']
+    search_fields = ['reference_id', 'user__id', 'aadhaar_hash']

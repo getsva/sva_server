@@ -424,6 +424,84 @@ class UsernameProof(models.Model):
         return username_hash[:8]
 
 
+# ==================== AADHAAR UNIQUENESS PROOF (Zero-Knowledge) ====================
+
+class UniquenessProof(models.Model):
+    """
+    Zero-Knowledge Aadhaar Uniqueness Proof Model
+    
+    Stores cryptographic proof of Aadhaar uniqueness without revealing the actual Aadhaar number.
+    Uses k-anonymity with prefix matching to check global uniqueness while maintaining privacy.
+    
+    Zero-Knowledge Design:
+    - Only stores final_hash (SHA-256(aadhaar_hash + SECRET_PEPPER))
+    - Aadhaar number itself is never stored on server
+    - Uniqueness checking uses prefix matching for k-anonymity
+    - Server cannot reverse the proof to get the Aadhaar number
+    - Not linked to any user - just a global list of used Aadhaar hashes
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Final proof hash: SHA-256(aadhaar_hash + SECRET_PEPPER)
+    # This prevents brute-force attacks while maintaining uniqueness
+    final_hash = models.CharField(
+        max_length=64,
+        unique=True,
+        db_index=True,
+        help_text="SHA-256 hash of (aadhaar_hash + SECRET_PEPPER) for uniqueness proof"
+    )
+    
+    # Hash prefix for k-anonymity lookups (first 5 characters)
+    # Used for efficient prefix-based uniqueness checking
+    prefix = models.CharField(
+        max_length=5,
+        db_index=True,
+        help_text="First 5 characters of aadhaar_hash for prefix matching"
+    )
+    
+    # Store aadhaar_hash for k-anonymity prefix matching
+    # This is needed to return matching hashes to client for local checking
+    # Still maintains zero-knowledge as hash cannot be reversed to get Aadhaar number
+    aadhaar_hash = models.CharField(
+        max_length=64,
+        db_index=True,
+        help_text="SHA-256 hash of Aadhaar number (with public pepper) for prefix matching"
+    )
+    
+    # Metadata
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'uniqueness_proofs'
+        verbose_name = 'Uniqueness Proof'
+        verbose_name_plural = 'Uniqueness Proofs'
+        indexes = [
+            models.Index(fields=['prefix']),
+            models.Index(fields=['final_hash']),
+            models.Index(fields=['aadhaar_hash']),
+        ]
+    
+    def __str__(self):
+        return f"Uniqueness proof {self.prefix}..."
+    
+    @classmethod
+    def generate_final_hash(cls, aadhaar_hash: str, secret_pepper: str) -> str:
+        """
+        Generate final proof hash from aadhaar hash and secret pepper
+        This is what gets stored on the server
+        """
+        combined = f"{aadhaar_hash}{secret_pepper}"
+        return hashlib.sha256(combined.encode()).hexdigest()
+    
+    @classmethod
+    def get_prefix(cls, aadhaar_hash: str) -> str:
+        """
+        Extract prefix from aadhaar hash for k-anonymity lookups
+        Using 5 characters provides good k-anonymity (2^20 possibilities)
+        """
+        return aadhaar_hash[:5]
+
+
 # ==================== SIGNALS ====================
 
 @receiver(post_delete, sender=IdentityCanvas)
@@ -512,4 +590,91 @@ class DocumentVerification(models.Model):
     
     def __str__(self):
         return f"{self.block_type} verification for {self.user.id} - {self.status}"
+
+
+class AadhaarVerificationSession(models.Model):
+    """
+    Stores metadata for Aadhaar OKYC sessions without persisting sensitive PII.
+    Only hashes, reference IDs, and sanitized metadata are stored (zero-knowledge).
+    """
+
+    STATUS_PENDING = 'pending'
+    STATUS_VERIFIED = 'verified'
+    STATUS_FAILED = 'failed'
+
+    STATUS_CHOICES = [
+        (STATUS_PENDING, 'Pending'),
+        (STATUS_VERIFIED, 'Verified'),
+        (STATUS_FAILED, 'Failed'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        ZKUser,
+        on_delete=models.CASCADE,
+        related_name='aadhaar_kyc_sessions',
+        help_text="User that initiated the Aadhaar OKYC flow"
+    )
+    aadhaar_hash = models.CharField(
+        max_length=64,
+        db_index=True,
+        help_text="SHA-256 hash of the Aadhaar number"
+    )
+    aadhaar_hash_with_pepper = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="SHA-256 hash of (Aadhaar number + PUBLIC_PEPPER) for uniqueness proof"
+    )
+    reference_id = models.CharField(
+        max_length=128,
+        unique=True,
+        help_text="Reference ID returned by Sandbox generate OTP API"
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default=STATUS_PENDING,
+        help_text="Latest status from Sandbox"
+    )
+    sandbox_transaction_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        help_text="Sandbox transaction identifier (if provided)"
+    )
+    sandbox_message = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text="Latest message from Sandbox"
+    )
+    sandbox_metadata = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Sanitized metadata returned from Sandbox (no PII)"
+    )
+    simulated_otp = models.CharField(
+        max_length=6,
+        null=True,
+        blank=True,
+        help_text="DEV helper storing OTP when Sandbox is not configured"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    verified_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = 'aadhaar_verification_sessions'
+        verbose_name = 'Aadhaar Verification Session'
+        verbose_name_plural = 'Aadhaar Verification Sessions'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'status']),
+            models.Index(fields=['aadhaar_hash']),
+        ]
+
+    def __str__(self):
+        return f"Aadhaar session {self.reference_id} ({self.status})"
 

@@ -73,3 +73,47 @@ class DocumentVerificationSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
 
+
+class AadhaarGenerateOTPSerializer(serializers.Serializer):
+    aadhaar_number = serializers.CharField(min_length=12, max_length=14)
+    consent = serializers.ChoiceField(
+        choices=[("Y", "Yes")],
+        default="Y",
+    )
+    reason = serializers.CharField(
+        max_length=255,
+        required=False,
+        allow_blank=True,
+        default="identity_verification",
+    )
+
+    def validate_aadhaar_number(self, value):
+        normalized = "".join(filter(str.isdigit, value or ""))
+        if len(normalized) != 12:
+            raise serializers.ValidationError("Aadhaar number must be a 12-digit value.")
+        return normalized
+
+
+class AadhaarVerifyOTPSerializer(serializers.Serializer):
+    reference_id = serializers.CharField(max_length=128)
+    otp = serializers.CharField(min_length=6, max_length=6)
+
+
+class CleanupVerificationDataSerializer(serializers.Serializer):
+    """
+    Serializer for cleaning up verification data when blocks are deleted
+    """
+    block_type = serializers.ChoiceField(choices=VerificationBlockType.choices)
+    value_hash = serializers.CharField(
+        max_length=64,
+        required=False,
+        allow_null=True,
+        help_text="SHA-256 hash of the value (for VerifiedBlock cleanup)"
+    )
+    aadhaar_hash_with_pepper = serializers.CharField(
+        max_length=64,
+        required=False,
+        allow_null=True,
+        help_text="SHA-256 hash of (Aadhaar + PUBLIC_PEPPER) for UniquenessProof cleanup"
+    )
+
