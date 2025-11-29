@@ -5,6 +5,10 @@ import hashlib
 import hmac
 import logging
 import uuid
+import pyotp
+import qrcode
+import io
+import json
 
 import requests
 from django.conf import settings
@@ -17,7 +21,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import ZKUser, ZKRefreshToken, ZKEmailVerificationToken
+from .models import ZKUser, ZKRefreshToken, ZKEmailVerificationToken, ZKTwoFactorAuth, ZKTwoFactorLoginSession, ZKTwoFactorLoginSession
 from .serializers import (
     ZKRegisterSerializer, 
     ZKLoginSerializer, 
@@ -31,6 +35,11 @@ from .serializers import (
     ZKEmailVerificationConfirmSerializer,
     ZKEmailLoginSerializer,
     ZKGetSaltByEmailSerializer,
+    ZKChangeMasterKeySerializer,
+    ZKTwoFactorSetupSerializer,
+    ZKTwoFactorVerifySerializer,
+    ZKTwoFactorDisableSerializer,
+    ZKTwoFactorLoginVerifySerializer,
 )
 from .token_utils import generate_access_token, generate_refresh_token, generate_data_token
 
@@ -914,6 +923,27 @@ class ZKEmailLoginView(generics.GenericAPIView):
                 status=status.HTTP_401_UNAUTHORIZED
             )
         
+        # Check if 2FA is enabled
+        try:
+            two_fa = ZKTwoFactorAuth.objects.get(user=zk_user, is_enabled=True)
+            # 2FA is enabled - create temporary session and require 2FA verification
+            temp_session = ZKTwoFactorLoginSession.objects.create(
+                user=zk_user,
+                encrypted_data=zk_user.encrypted_data,
+                salt=zk_user.salt,
+                device_fingerprint=device_fingerprint,
+                auth_method='passkey' if zk_user.has_passkey else 'master_key'
+            )
+            
+            return Response({
+                "requires_2fa": True,
+                "temp_token": str(temp_session.temp_token),
+                "message": "2FA verification required"
+            }, status=status.HTTP_200_OK)
+        except ZKTwoFactorAuth.DoesNotExist:
+            # 2FA not enabled - proceed with normal login
+            pass
+        
         # Update last login
         zk_user.last_login = timezone.now()
         zk_user.save(update_fields=['last_login'])
@@ -931,5 +961,356 @@ class ZKEmailLoginView(generics.GenericAPIView):
             "user": ZKUserDetailsSerializer(zk_user).data,
             "encrypted_data": zk_user.encrypted_data,
             "salt": zk_user.salt,
-            "auth_method": auth_method
+            "auth_method": auth_method,
+            "requires_2fa": False
         })
+
+# ==================== SECURITY MANAGEMENT VIEWS ====================
+
+class ZKChangeMasterKeyView(APIView):
+    """
+    Change master key for user account
+    Requires current master key verification
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request):
+        serializer = ZKChangeMasterKeySerializer(
+            data=request.data,
+            context={'user': request.user}
+        )
+        serializer.is_valid(raise_exception=True)
+        
+        # Verify current auth proof
+        if request.user.auth_proof != serializer.validated_data['current_auth_proof']:
+            return Response(
+                {'error': 'Invalid current master key'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+        
+        # Check if new auth proof already exists (different user)
+        if ZKUser.objects.filter(auth_proof=serializer.validated_data['new_auth_proof']).exclude(id=request.user.id).exists():
+            return Response(
+                {'error': 'This master key is already in use by another account'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Update user with new master key data
+        request.user.encrypted_data = serializer.validated_data['new_encrypted_data']
+        request.user.salt = serializer.validated_data['new_salt']
+        request.user.auth_proof = serializer.validated_data['new_auth_proof']
+        request.user.updated_at = timezone.now()
+        request.user.save(update_fields=['encrypted_data', 'salt', 'auth_proof', 'updated_at'])
+        
+        return Response({
+            'message': 'Master key changed successfully',
+            'user': ZKUserDetailsSerializer(request.user).data
+        }, status=status.HTTP_200_OK)
+
+
+class ZKTwoFactorSetupView(APIView):
+    """
+    Setup 2FA for user account
+    Returns QR code and secret for authenticator app
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        # Get or create 2FA record
+        two_fa, created = ZKTwoFactorAuth.objects.get_or_create(user=request.user)
+        
+        # Generate new secret if not already set or if resetting
+        if not two_fa.totp_secret or not two_fa.is_enabled:
+            two_fa.totp_secret = pyotp.random_base32()
+            two_fa.is_enabled = False
+            two_fa.save()
+        
+        # Generate provisioning URI
+        totp = pyotp.TOTP(two_fa.totp_secret)
+        provisioning_uri = totp.provisioning_uri(
+            name=str(request.user.id),
+            issuer_name="SVA"
+        )
+        
+        # Generate QR code
+        qr = qrcode.QRCode(version=1, box_size=10, border=5)
+        qr.add_data(provisioning_uri)
+        qr.make(fit=True)
+        
+        img = qr.make_image(fill_color="black", back_color="white")
+        buffer = io.BytesIO()
+        img.save(buffer, format='PNG')
+        qr_code_data = base64.b64encode(buffer.getvalue()).decode()
+        
+        return Response({
+            'secret': two_fa.totp_secret,
+            'qr_code': f'data:image/png;base64,{qr_code_data}',
+            'provisioning_uri': provisioning_uri,
+            'is_enabled': two_fa.is_enabled
+        }, status=status.HTTP_200_OK)
+    
+    def post(self, request):
+        serializer = ZKTwoFactorSetupSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        two_fa, _ = ZKTwoFactorAuth.objects.get_or_create(user=request.user)
+        
+        if not two_fa.totp_secret:
+            return Response(
+                {'error': '2FA not initialized. Please call GET first.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Verify TOTP code
+        totp_code = serializer.validated_data.get('totp_code')
+        if totp_code:
+            totp = pyotp.TOTP(two_fa.totp_secret)
+            if not totp.verify(totp_code, valid_window=1):
+                return Response(
+                    {'error': 'Invalid TOTP code'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Generate backup codes
+            backup_codes = [pyotp.random_base32()[:8].upper() for _ in range(10)]
+            two_fa.backup_codes = json.dumps(backup_codes)
+            two_fa.is_enabled = True
+            two_fa.save()
+            
+            return Response({
+                'message': '2FA enabled successfully',
+                'backup_codes': backup_codes,
+                'is_enabled': True
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            'message': '2FA setup initiated. Verify with TOTP code to enable.',
+            'is_enabled': False
+        }, status=status.HTTP_200_OK)
+
+
+class ZKTwoFactorStatusView(APIView):
+    """
+    Get 2FA status for current user
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        try:
+            two_fa = ZKTwoFactorAuth.objects.get(user=request.user)
+            return Response({
+                'is_enabled': two_fa.is_enabled,
+                'has_backup_codes': bool(two_fa.backup_codes)
+            }, status=status.HTTP_200_OK)
+        except ZKTwoFactorAuth.DoesNotExist:
+            return Response({
+                'is_enabled': False,
+                'has_backup_codes': False
+            }, status=status.HTTP_200_OK)
+
+
+class ZKTwoFactorDisableView(APIView):
+    """
+    Disable 2FA for user account
+    Requires master key verification and TOTP code
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request):
+        serializer = ZKTwoFactorDisableSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        # Verify auth proof
+        if request.user.auth_proof != serializer.validated_data['auth_proof']:
+            return Response(
+                {'error': 'Invalid master key verification'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+        
+        try:
+            two_fa = ZKTwoFactorAuth.objects.get(user=request.user, is_enabled=True)
+        except ZKTwoFactorAuth.DoesNotExist:
+            return Response(
+                {'error': '2FA is not enabled'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Verify TOTP code
+        totp = pyotp.TOTP(two_fa.totp_secret)
+        totp_code = serializer.validated_data['totp_code']
+        
+        # Check backup codes too
+        backup_codes = json.loads(two_fa.backup_codes) if two_fa.backup_codes else []
+        is_valid_backup = totp_code in backup_codes
+        
+        if not totp.verify(totp_code, valid_window=1) and not is_valid_backup:
+            return Response(
+                {'error': 'Invalid TOTP code'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Remove used backup code if applicable
+        if is_valid_backup:
+            backup_codes.remove(totp_code)
+            two_fa.backup_codes = json.dumps(backup_codes) if backup_codes else None
+        
+        # Disable 2FA
+        two_fa.is_enabled = False
+        two_fa.save()
+        
+        return Response({
+            'message': '2FA disabled successfully'
+        }, status=status.HTTP_200_OK)
+
+
+class ZKActiveSessionsView(APIView):
+    """
+    Get and manage active sessions for user
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        # Get all active refresh tokens for user
+        active_tokens = ZKRefreshToken.objects.filter(
+            user=request.user,
+            expires_at__gt=timezone.now()
+        ).order_by('-created_at')
+        
+        sessions = []
+        current_token = request.headers.get('Authorization', '').replace('Bearer ', '')
+        
+        for token in active_tokens:
+            # Try to get access token from request to identify current session
+            is_current = False
+            try:
+                from .token_utils import get_user_from_token
+                user_from_token = get_user_from_token(current_token)
+                if user_from_token and user_from_token.id == request.user.id:
+                    is_current = True
+            except:
+                pass
+            
+            sessions.append({
+                'id': str(token.id),
+                'created_at': token.created_at.isoformat(),
+                'expires_at': token.expires_at.isoformat(),
+                'auth_method': token.auth_method,
+                'device_fingerprint': token.device_fingerprint[:8] + '...' if token.device_fingerprint else None,
+                'device_info': token.device_info,
+                'ip_address': str(token.ip_address) if token.ip_address else None,
+                'is_current': is_current
+            })
+        
+        return Response({
+            'sessions': sessions,
+            'total': len(sessions)
+        }, status=status.HTTP_200_OK)
+    
+    def delete(self, request):
+        session_id = request.data.get('session_id')
+        
+        if not session_id:
+            return Response(
+                {'error': 'session_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            token = ZKRefreshToken.objects.get(
+                id=session_id,
+                user=request.user
+            )
+            token.delete()
+            
+            return Response({
+                'message': 'Session revoked successfully'
+            }, status=status.HTTP_200_OK)
+        except ZKRefreshToken.DoesNotExist:
+            return Response(
+                {'error': 'Session not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+
+class ZKTwoFactorLoginVerifyView(APIView):
+    """
+    Verify 2FA code during login and complete authentication
+    """
+    permission_classes = [AllowAny]
+    
+    def post(self, request):
+        serializer = ZKTwoFactorLoginVerifySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        temp_token = serializer.validated_data['temp_token']
+        totp_code = serializer.validated_data['totp_code']
+        
+        try:
+            temp_session = ZKTwoFactorLoginSession.objects.get(temp_token=temp_token)
+        except ZKTwoFactorLoginSession.DoesNotExist:
+            return Response(
+                {'error': 'Invalid or expired temporary token'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not temp_session.is_valid:
+            temp_session.delete()
+            return Response(
+                {'error': 'Temporary session has expired. Please login again.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Verify 2FA code
+        try:
+            two_fa = ZKTwoFactorAuth.objects.get(user=temp_session.user, is_enabled=True)
+        except ZKTwoFactorAuth.DoesNotExist:
+            temp_session.delete()
+            return Response(
+                {'error': '2FA is not enabled for this account'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        totp = pyotp.TOTP(two_fa.totp_secret)
+        backup_codes = json.loads(two_fa.backup_codes) if two_fa.backup_codes else []
+        is_valid_backup = totp_code in backup_codes
+        
+        if not totp.verify(totp_code, valid_window=1) and not is_valid_backup:
+            return Response(
+                {'error': 'Invalid TOTP code'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Remove used backup code if applicable
+        if is_valid_backup:
+            backup_codes.remove(totp_code)
+            two_fa.backup_codes = json.dumps(backup_codes) if backup_codes else None
+            two_fa.save()
+        
+        # Update 2FA last used
+        two_fa.last_used = timezone.now()
+        two_fa.save()
+        
+        # Update last login
+        temp_session.user.last_login = timezone.now()
+        temp_session.user.save(update_fields=['last_login'])
+        
+        # Generate tokens
+        access_token = generate_access_token(temp_session.user)
+        refresh_token = generate_refresh_token(
+            temp_session.user,
+            auth_method=temp_session.auth_method,
+            device_fingerprint=temp_session.device_fingerprint
+        )
+        
+        # Clean up temporary session
+        temp_session.delete()
+        
+        return Response({
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "user": ZKUserDetailsSerializer(temp_session.user).data,
+            "encrypted_data": temp_session.encrypted_data,
+            "salt": temp_session.salt,
+            "auth_method": temp_session.auth_method,
+            "requires_2fa": False
+        }, status=status.HTTP_200_OK)

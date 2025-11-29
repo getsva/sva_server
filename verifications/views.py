@@ -19,6 +19,7 @@ from identity_canvas.models import (
     VerifiedBlock,
     AadhaarVerificationSession,
     UniquenessProof,
+    PANUniquenessProof,
 )
 from .serializers import (
     RequestOTPSerializer,
@@ -226,23 +227,41 @@ class RequestDocumentVerificationView(APIView):
         document_identifier = serializer.validated_data["document_identifier"]
         verification_method = serializer.validated_data["verification_method"]
         additional_data = serializer.validated_data.get("additional_data") or {}
+        
+        # For PAN verification, only store pan_hash_with_pepper (zero-knowledge)
+        # Do NOT store the actual PAN number in metadata
 
-        verification = DocumentVerification.objects.create(
+        document_hash = _hash_document_identifier(document_identifier)
+        
+        # Use get_or_create to handle existing verifications gracefully
+        verification, created = DocumentVerification.objects.get_or_create(
             user=user,
             block_type=block_type,
-            document_hash=_hash_document_identifier(document_identifier),
-            verification_method=verification_method,
-            status="pending",
-            verification_metadata=json.dumps(additional_data),
+            document_hash=document_hash,
+            defaults={
+                "verification_method": verification_method,
+                "status": "pending",
+                "verification_metadata": json.dumps(additional_data),
+            }
         )
+        
+        # If verification already exists, update metadata if needed
+        if not created:
+            existing_metadata = json.loads(verification.verification_metadata or "{}")
+            existing_metadata.update(additional_data)
+            verification.verification_metadata = json.dumps(existing_metadata)
+            # Reset status to pending if it was rejected/expired
+            if verification.status in ["rejected", "expired"]:
+                verification.status = "pending"
+            verification.save(update_fields=["verification_metadata", "status"])
 
         return Response(
             {
-                "message": "Document verification requested",
+                "message": "Document verification requested" if created else "Verification already exists, returning existing verification",
                 "verification_id": str(verification.id),
                 "status": verification.status,
             },
-            status=status.HTTP_201_CREATED,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
         )
 
 
@@ -261,12 +280,97 @@ class VerifyDocumentView(APIView):
         except DocumentVerification.DoesNotExist:
             return Response({"error": "Verification not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        # Placeholder: In the future integrate with external providers
-        verification.status = "verified"
-        verification.verified_at = timezone.now()
-        verification.save(update_fields=["status", "verified_at"])
+        # For PAN verification via third-party, call Sandbox API
+        if verification.block_type == VerificationBlockType.PAN_CARD and verification.verification_method == "third_party":
+            # Get PAN details from request (zero-knowledge - not stored in DB)
+            pan_details = serializer.validated_data.get("pan_details")
+            if not pan_details:
+                return Response(
+                    {"error": "Missing required PAN verification details (pan_details)"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            pan_number = pan_details.get("pan_number")
+            name_as_per_pan = pan_details.get("name_as_per_pan")
+            date_of_birth = pan_details.get("date_of_birth")
+            consent = pan_details.get("consent", "Y")
+            reason = pan_details.get("reason", "identity_verification")
+            
+            if not all([pan_number, name_as_per_pan, date_of_birth]):
+                return Response(
+                    {"error": "Missing required PAN verification fields (pan_number, name_as_per_pan, date_of_birth)"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            try:
+                sandbox_client = SandboxKYCClient()
+                if not sandbox_client.is_configured:
+                    # Fallback to mock if Sandbox is not configured
+                    if _sandbox_allow_mock_fallback():
+                        logger.warning("Sandbox not configured, using mock PAN verification")
+                        verification.status = "verified"
+                        verification.verified_at = timezone.now()
+                        verification.save(update_fields=["status", "verified_at"])
+                    else:
+                        return Response(
+                            {"error": "PAN verification service is not configured"},
+                            status=status.HTTP_503_SERVICE_UNAVAILABLE
+                        )
+                else:
+                    # Call Sandbox API
+                    sandbox_response = sandbox_client.verify_pan(
+                        pan=pan_number,
+                        name_as_per_pan=name_as_per_pan,
+                        date_of_birth=date_of_birth,
+                        consent=consent,
+                        reason=reason
+                    )
+                    
+                    # Check if verification was successful
+                    data = sandbox_response.get("data", {})
+                    pan_status = data.get("status", "").lower()
+                    
+                    if pan_status == "valid":
+                        verification.status = "verified"
+                        verification.verified_at = timezone.now()
+                        # Store only sanitized Sandbox response (no PII) in metadata
+                        import json
+                        existing_metadata = json.loads(verification.verification_metadata or "{}")
+                        # Only store sanitized response - never store PAN number or other PII
+                        existing_metadata["sandbox_response"] = _sanitize_sandbox_metadata(sandbox_response)
+                        verification.verification_metadata = json.dumps(existing_metadata)
+                        verification.save(update_fields=["status", "verified_at", "verification_metadata"])
+                    else:
+                        verification.status = "rejected"
+                        verification.save(update_fields=["status"])
+                        return Response(
+                            {
+                                "error": f"PAN verification failed: {data.get('remarks', 'Invalid PAN')}",
+                                "verified": False,
+                                "status": verification.status,
+                            },
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+            except SandboxAPIError as e:
+                logger.error("Sandbox PAN verification failed: %s", e)
+                # If Sandbox returns 403 or other errors, allow mock fallback if enabled
+                if _sandbox_allow_mock_fallback():
+                    logger.warning("Sandbox PAN verification failed, using mock fallback: %s", e)
+                    verification.status = "verified"
+                    verification.verified_at = timezone.now()
+                    verification.save(update_fields=["status", "verified_at"])
+                else:
+                    return Response(
+                        {"error": f"PAN verification service error: {str(e)}"},
+                        status=status.HTTP_502_BAD_GATEWAY
+                    )
+        else:
+            # For other document types or methods, use placeholder logic
+            verification.status = "verified"
+            verification.verified_at = timezone.now()
+            verification.save(update_fields=["status", "verified_at"])
 
-        VerifiedBlock.objects.update_or_create(
+        verified_block, created = VerifiedBlock.objects.update_or_create(
             user=request.user,
             block_type=verification.block_type,
             value_hash=verification.document_hash,
@@ -275,6 +379,29 @@ class VerifyDocumentView(APIView):
                 "verification_method": verification.verification_method or "document",
             },
         )
+
+        # Store PAN uniqueness proof if this is a PAN verification
+        if verification.block_type == VerificationBlockType.PAN_CARD:
+            import json
+            verification_metadata = json.loads(verification.verification_metadata or "{}")
+            pan_hash_with_pepper = verification_metadata.get("pan_hash_with_pepper")
+            
+            if pan_hash_with_pepper:
+                from django.conf import settings
+                secret_pepper = getattr(settings, 'SVA_SECRET_SERVER_PEPPER', 'sva-secret-server-pepper-2024-never-expose-this-value')
+                
+                # Generate final_hash with secret pepper
+                final_hash = PANUniquenessProof.generate_final_hash(pan_hash_with_pepper, secret_pepper)
+                prefix = PANUniquenessProof.get_prefix(pan_hash_with_pepper)
+                
+                # Store uniqueness proof (get_or_create to handle race conditions)
+                PANUniquenessProof.objects.get_or_create(
+                    final_hash=final_hash,
+                    defaults={
+                        'pan_hash': pan_hash_with_pepper,
+                        'prefix': prefix,
+                    }
+                )
 
         return Response(
             {
@@ -402,6 +529,39 @@ class AadhaarAnonCheckView(APIView):
         # Return aadhaar_hashes (not final_hashes) so client can check locally
         matching_proofs = UniquenessProof.objects.filter(prefix=prefix)
         matching_hashes = list(matching_proofs.values_list('aadhaar_hash', flat=True))
+        
+        return Response({
+            'prefix': prefix,
+            'matching_hashes': matching_hashes,
+            'count': len(matching_hashes)
+        }, status=status.HTTP_200_OK)
+
+
+class PANAnonCheckView(APIView):
+    """
+    Check PAN uniqueness using k-anonymity prefix matching
+    
+    Zero-Knowledge Design:
+    - Client sends prefix (first 5 chars) of hashed PAN number
+    - Server returns list of full hashes matching that prefix
+    - Client checks locally if its full hash exists
+    - Server never learns the actual PAN number or full hash
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        prefix = request.query_params.get('prefix', '').strip()
+        
+        if not prefix or len(prefix) != 5:
+            return Response(
+                {"error": "Prefix must be exactly 5 characters"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get all proofs with matching prefix
+        # Return pan_hashes (not final_hashes) so client can check locally
+        matching_proofs = PANUniquenessProof.objects.filter(prefix=prefix)
+        matching_hashes = list(matching_proofs.values_list('pan_hash', flat=True))
         
         return Response({
             'prefix': prefix,
@@ -718,6 +878,24 @@ class CleanupVerificationDataView(APIView):
                 # If no aadhaar_hash_with_pepper provided, we can't safely delete
                 # (multiple users might have verified the same Aadhaar)
                 # For now, we'll skip UniquenessProof deletion if hash not provided
+                pass
+        
+        # For PAN, also delete PANUniquenessProof
+        if block_type == VerificationBlockType.PAN_CARD:
+            pan_hash_with_pepper = serializer.validated_data.get("pan_hash_with_pepper")
+            if pan_hash_with_pepper:
+                # Delete specific PANUniquenessProof by pan_hash_with_pepper
+                secret_pepper = getattr(settings, 'SVA_SECRET_SERVER_PEPPER', 'sva-secret-server-pepper-2024-never-expose-this-value')
+                final_hash = PANUniquenessProof.generate_final_hash(pan_hash_with_pepper, secret_pepper)
+                
+                pan_uniqueness_proofs = PANUniquenessProof.objects.filter(final_hash=final_hash)
+                deleted_pan_proofs = pan_uniqueness_proofs.count()
+                deleted_uniqueness_proofs += deleted_pan_proofs
+                pan_uniqueness_proofs.delete()
+            else:
+                # If no pan_hash_with_pepper provided, we can't safely delete
+                # (multiple users might have verified the same PAN)
+                # For now, we'll skip PANUniquenessProof deletion if hash not provided
                 pass
         
         return Response({

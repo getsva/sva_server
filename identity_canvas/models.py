@@ -502,6 +502,84 @@ class UniquenessProof(models.Model):
         return aadhaar_hash[:5]
 
 
+# ==================== PAN UNIQUENESS PROOF (Zero-Knowledge) ====================
+
+class PANUniquenessProof(models.Model):
+    """
+    Zero-Knowledge PAN Uniqueness Proof Model
+    
+    Stores cryptographic proof of PAN uniqueness without revealing the actual PAN number.
+    Uses k-anonymity with prefix matching to check global uniqueness while maintaining privacy.
+    
+    Zero-Knowledge Design:
+    - Only stores final_hash (SHA-256(pan_hash + SECRET_PEPPER))
+    - PAN number itself is never stored on server
+    - Uniqueness checking uses prefix matching for k-anonymity
+    - Server cannot reverse the proof to get the PAN number
+    - Not linked to any user - just a global list of used PAN hashes
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Final proof hash: SHA-256(pan_hash + SECRET_PEPPER)
+    # This prevents brute-force attacks while maintaining uniqueness
+    final_hash = models.CharField(
+        max_length=64,
+        unique=True,
+        db_index=True,
+        help_text="SHA-256 hash of (pan_hash + SECRET_PEPPER) for uniqueness proof"
+    )
+    
+    # Hash prefix for k-anonymity lookups (first 5 characters)
+    # Used for efficient prefix-based uniqueness checking
+    prefix = models.CharField(
+        max_length=5,
+        db_index=True,
+        help_text="First 5 characters of pan_hash for prefix matching"
+    )
+    
+    # Store pan_hash for k-anonymity prefix matching
+    # This is needed to return matching hashes to client for local checking
+    # Still maintains zero-knowledge as hash cannot be reversed to get PAN number
+    pan_hash = models.CharField(
+        max_length=64,
+        db_index=True,
+        help_text="SHA-256 hash of PAN number (with public pepper) for prefix matching"
+    )
+    
+    # Metadata
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'pan_uniqueness_proofs'
+        verbose_name = 'PAN Uniqueness Proof'
+        verbose_name_plural = 'PAN Uniqueness Proofs'
+        indexes = [
+            models.Index(fields=['prefix']),
+            models.Index(fields=['final_hash']),
+            models.Index(fields=['pan_hash']),
+        ]
+    
+    def __str__(self):
+        return f"PAN uniqueness proof {self.prefix}..."
+    
+    @classmethod
+    def generate_final_hash(cls, pan_hash: str, secret_pepper: str) -> str:
+        """
+        Generate final proof hash from pan hash and secret pepper
+        This is what gets stored on the server
+        """
+        combined = f"{pan_hash}{secret_pepper}"
+        return hashlib.sha256(combined.encode()).hexdigest()
+    
+    @classmethod
+    def get_prefix(cls, pan_hash: str) -> str:
+        """
+        Extract prefix from pan hash for k-anonymity lookups
+        Using 5 characters provides good k-anonymity (2^20 possibilities)
+        """
+        return pan_hash[:5]
+
+
 # ==================== SIGNALS ====================
 
 @receiver(post_delete, sender=IdentityCanvas)

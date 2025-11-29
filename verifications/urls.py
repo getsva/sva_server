@@ -12,6 +12,7 @@ from .views import (
     AadhaarAnonCheckView,
     AadhaarGenerateOTPView,
     AadhaarVerifyOTPView,
+    PANAnonCheckView,
     CleanupVerificationDataView,
 )
 
@@ -27,6 +28,7 @@ urlpatterns = [
     path("aadhaar/anon-check/", AadhaarAnonCheckView.as_view(), name="aadhaar_anon_check"),
     path("aadhaar/okyc/generate/", AadhaarGenerateOTPView.as_view(), name="aadhaar_generate_otp"),
     path("aadhaar/okyc/verify/", AadhaarVerifyOTPView.as_view(), name="aadhaar_verify_otp"),
+    path("pan/anon-check/", PANAnonCheckView.as_view(), name="pan_anon_check"),
     path("cleanup/", CleanupVerificationDataView.as_view(), name="cleanup_verification_data"),
 ]
 

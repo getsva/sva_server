@@ -49,9 +49,19 @@ class DocumentVerificationRequestSerializer(serializers.Serializer):
     additional_data = serializers.JSONField(required=False)
 
 
+class PANDetailsSerializer(serializers.Serializer):
+    """PAN details for verification - sent in request but NOT stored (zero-knowledge)"""
+    pan_number = serializers.CharField(max_length=10)
+    name_as_per_pan = serializers.CharField(max_length=255)
+    date_of_birth = serializers.CharField(max_length=10)
+    consent = serializers.CharField(max_length=1, default="Y")
+    reason = serializers.CharField(max_length=255, required=False, default="identity_verification")
+
+
 class DocumentVerificationVerifySerializer(serializers.Serializer):
     verification_id = serializers.UUIDField()
     verification_code = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    pan_details = PANDetailsSerializer(required=False, allow_null=True)
 
 
 class DocumentVerificationStatusSerializer(serializers.Serializer):
@@ -115,5 +125,11 @@ class CleanupVerificationDataSerializer(serializers.Serializer):
         required=False,
         allow_null=True,
         help_text="SHA-256 hash of (Aadhaar + PUBLIC_PEPPER) for UniquenessProof cleanup"
+    )
+    pan_hash_with_pepper = serializers.CharField(
+        max_length=64,
+        required=False,
+        allow_null=True,
+        help_text="SHA-256 hash of (PAN + PUBLIC_PEPPER) for PANUniquenessProof cleanup"
     )
 

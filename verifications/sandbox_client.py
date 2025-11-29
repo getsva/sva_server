@@ -178,6 +178,32 @@ class SandboxKYCClient:
         # Verify endpoint requires API version 2.0 according to Sandbox documentation
         return self._post(self.verify_endpoint, payload, api_version_override="2.0")
 
+    def verify_pan(self, pan: str, name_as_per_pan: str, date_of_birth: str, consent: str, reason: str) -> Dict[str, Any]:
+        """
+        Verify PAN details using Sandbox API.
+        
+        Args:
+            pan: PAN number (10 characters)
+            name_as_per_pan: Name as per PAN card
+            date_of_birth: Date of birth in DD/MM/YYYY format
+            consent: Consent value (typically "Y")
+            reason: Reason for verification
+        
+        Returns:
+            Response from Sandbox API
+        """
+        payload = {
+            "@entity": "in.co.sandbox.kyc.pan_verification.request",
+            "pan": pan,
+            "name_as_per_pan": name_as_per_pan,
+            "date_of_birth": date_of_birth,
+            "consent": consent,
+            "reason": reason,
+        }
+        pan_verify_endpoint = getattr(settings, 'SANDBOX_PAN_VERIFY_ENDPOINT', '/kyc/pan/verify')
+        # PAN verification endpoint - no API version override needed based on Postman collection
+        return self._post(pan_verify_endpoint, payload)
+
 
 __all__ = [
     "SandboxKYCClient",

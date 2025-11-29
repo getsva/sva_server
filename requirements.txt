@@ -7,3 +7,6 @@ psycopg2-binary
 requests
 PyJWT
 whitenoise
+pyotp
+qrcode
+pillow

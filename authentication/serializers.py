@@ -474,3 +474,95 @@ class ZKGetSaltByEmailSerializer(serializers.Serializer):
         if not value:
             raise serializers.ValidationError("Email is required.")
         return value.lower()
+
+
+# ==================== SECURITY MANAGEMENT SERIALIZERS ====================
+
+class ZKChangeMasterKeySerializer(serializers.Serializer):
+    """
+    Serializer for changing master key
+    """
+    current_auth_proof = serializers.CharField(
+        required=True,
+        help_text="Current authentication proof to verify identity"
+    )
+    new_encrypted_data = serializers.CharField(
+        required=True,
+        help_text="Re-encrypted user data with new master key"
+    )
+    new_salt = serializers.CharField(
+        required=True,
+        max_length=255,
+        help_text="New salt for key derivation"
+    )
+    new_auth_proof = serializers.CharField(
+        required=True,
+        max_length=255,
+        help_text="New authentication proof derived from new master key"
+    )
+    
+    def validate_new_salt(self, value):
+        if not value or len(value) < 20:
+            raise serializers.ValidationError(
+                "New salt appears to be invalid or too short."
+            )
+        return value
+    
+    def validate_new_auth_proof(self, value):
+        if not value or len(value) < 40:
+            raise serializers.ValidationError(
+                "New authentication proof appears to be invalid."
+            )
+        return value
+
+
+class ZKTwoFactorSetupSerializer(serializers.Serializer):
+    """
+    Serializer for 2FA setup
+    """
+    totp_code = serializers.CharField(
+        required=False,
+        max_length=6,
+        help_text="TOTP code to verify during setup"
+    )
+
+
+class ZKTwoFactorVerifySerializer(serializers.Serializer):
+    """
+    Serializer for 2FA verification
+    """
+    totp_code = serializers.CharField(
+        required=True,
+        max_length=6,
+        help_text="TOTP code from authenticator app"
+    )
+
+
+class ZKTwoFactorDisableSerializer(serializers.Serializer):
+    """
+    Serializer for disabling 2FA
+    """
+    auth_proof = serializers.CharField(
+        required=True,
+        help_text="Authentication proof to verify master key"
+    )
+    totp_code = serializers.CharField(
+        required=True,
+        max_length=6,
+        help_text="TOTP code to verify before disabling"
+    )
+
+
+class ZKTwoFactorLoginVerifySerializer(serializers.Serializer):
+    """
+    Serializer for verifying 2FA during login
+    """
+    temp_token = serializers.UUIDField(
+        required=True,
+        help_text="Temporary token from login response"
+    )
+    totp_code = serializers.CharField(
+        required=True,
+        max_length=6,
+        help_text="TOTP code from authenticator app"
+    )
