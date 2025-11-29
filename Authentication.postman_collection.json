@@ -1,0 +1,132 @@
+{
+	"info": {
+		"_postman_id": "ad00cdcf-6aa0-4b11-af76-b54a2c4c1673",
+		"name": "Authentication",
+		"description": "Authentication is the initial step to accessing the Sandbox API. It involves using the API Key and Secret to generate an access token. This token serves as a secure authorization method, enabling the API client to make authenticated API requests on behalf of the user or application.\n\n> Your unique API Key and API Secret are accessible via the dashboard, with separate sets for live and test environments, identified by the prefixes \"live\" and \"test\"",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "40279170",
+		"_collection_link": "https://www.postman.com/in-co-sandbox/workspace/sandbox-api/collection/29708799-ad00cdcf-6aa0-4b11-af76-b54a2c4c1673?action=share&source=collection_link&creator=40279170"
+	},
+	"item": [
+		{
+			"name": "Authenticate",
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"exec": [
+							"var jsonData = JSON.parse(responseBody);\r",
+							"pm.environment.set(\"access_token\", jsonData.data.access_token);"
+						],
+						"type": "text/javascript",
+						"packages": {}
+					}
+				}
+			],
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "x-api-key",
+						"value": "{{api_key}}"
+					},
+					{
+						"key": "x-api-secret",
+						"value": "{{api_secret}}"
+					},
+					{
+						"key": "x-api-version",
+						"value": "{{version}}"
+					}
+				],
+				"url": {
+					"raw": "{{sandbox_host}}/authenticate",
+					"host": [
+						"{{sandbox_host}}"
+					],
+					"path": [
+						"authenticate"
+					]
+				}
+			},
+			"response": [
+				{
+					"name": "200",
+					"originalRequest": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "x-api-key",
+								"value": "{{api_key}}"
+							},
+							{
+								"key": "x-api-secret",
+								"value": "{{api_secret}}"
+							},
+							{
+								"key": "x-api-version",
+								"value": "{{version}}"
+							}
+						],
+						"url": {
+							"raw": "{{sandbox_host}}/authenticate",
+							"host": [
+								"{{sandbox_host}}"
+							],
+							"path": [
+								"authenticate"
+							]
+						}
+					},
+					"status": "OK",
+					"code": 200,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Date",
+							"value": "Wed, 29 Jan 2025 12:04:53 GMT"
+						},
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						},
+						{
+							"key": "Content-Length",
+							"value": "2736"
+						},
+						{
+							"key": "Connection",
+							"value": "keep-alive"
+						},
+						{
+							"key": "x-amzn-RequestId",
+							"value": "1463d432-96d4-4b35-a93b-ea5496b5a7d9"
+						},
+						{
+							"key": "Access-Control-Allow-Origin",
+							"value": "*"
+						},
+						{
+							"key": "Access-Control-Allow-Headers",
+							"value": "*"
+						},
+						{
+							"key": "x-amz-apigw-id",
+							"value": "FJjmoFV2BcwETRA="
+						},
+						{
+							"key": "X-Requested-With",
+							"value": "*"
+						},
+						{
+							"key": "X-Amzn-Trace-Id",
+							"value": "Root=1-679a195d-428e209f7d0268d337e87bd2;Parent=033c841b46900a7c;Sampled=0;Lineage=1:8d678e15:0"
+						}
+					],
+					"cookie": [],
+					"body": "{\n    \"code\": 200,\n    \"timestamp\": 1750687659809,\n    \"data\": {\n        \"access_token\": \"{{vault:json-web-token}}\"\n    },\n    \"transaction_id\": \"3a31716a-6a4d-4670-83fe-849d8209e35a\"\n}"
+				}
+			]
+		}
+	]
+}

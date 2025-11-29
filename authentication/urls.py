@@ -8,6 +8,7 @@ from .views import (
     ZKLogoutView,
     ZKTokenRefreshView,
     ZKGetUserDataView,
+    ZKGetAllEncryptedDataView,
     ZKUpdateUserDataView,
     ZKDeleteAccountView,
     ZKPasskeyRegisterView,
@@ -20,6 +21,12 @@ from .views import (
     ZKEmailVerificationConfirmView,
     ZKGetSaltByEmailView,
     ZKEmailLoginView,
+    ZKChangeMasterKeyView,
+    ZKTwoFactorSetupView,
+    ZKTwoFactorStatusView,
+    ZKTwoFactorDisableView,
+    ZKActiveSessionsView,
+    ZKTwoFactorLoginVerifyView,
 )
 
 urlpatterns = [
@@ -53,6 +60,9 @@ urlpatterns = [
     # Get encrypted user data
     path('zk/user/data/', ZKGetUserDataView.as_view(), name='zk_user_data'),
     
+    # Get all encrypted data (for master key rotation)
+    path('zk/user/all-encrypted-data/', ZKGetAllEncryptedDataView.as_view(), name='zk_all_encrypted_data'),
+    
     # Update encrypted user data
     path('zk/user/update/', ZKUpdateUserDataView.as_view(), name='zk_user_update'),
     
@@ -80,4 +90,18 @@ urlpatterns = [
     
     # Statistics
     path('zk/stats/', ZKStatsView.as_view(), name='zk_stats'),
+    
+    # ========== Security Management Endpoints ==========
+    
+    # Master key management
+    path('zk/security/change-master-key/', ZKChangeMasterKeyView.as_view(), name='zk_change_master_key'),
+    
+    # Two-factor authentication
+    path('zk/security/2fa/setup/', ZKTwoFactorSetupView.as_view(), name='zk_2fa_setup'),
+    path('zk/security/2fa/status/', ZKTwoFactorStatusView.as_view(), name='zk_2fa_status'),
+    path('zk/security/2fa/disable/', ZKTwoFactorDisableView.as_view(), name='zk_2fa_disable'),
+    path('zk/security/2fa/verify-login/', ZKTwoFactorLoginVerifyView.as_view(), name='zk_2fa_verify_login'),
+    
+    # Active sessions management
+    path('zk/security/sessions/', ZKActiveSessionsView.as_view(), name='zk_active_sessions'),
 ]

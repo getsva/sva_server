@@ -229,3 +229,88 @@ class ZKEmailVerificationToken(models.Model):
     
     def __str__(self):
         return f"Email Verification Token for {self.email_hash[:8]}..."
+
+
+class ZKTwoFactorLoginSession(models.Model):
+    """
+    Temporary session for 2FA verification during login
+    Stores encrypted data temporarily until 2FA is verified
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        ZKUser,
+        on_delete=models.CASCADE,
+        related_name='two_factor_login_sessions'
+    )
+    temp_token = models.UUIDField(default=uuid.uuid4, editable=False, unique=True, db_index=True)
+    encrypted_data = models.TextField()
+    salt = models.CharField(max_length=255)
+    device_fingerprint = models.CharField(max_length=64, null=True, blank=True)
+    auth_method = models.CharField(
+        max_length=20,
+        choices=[('master_key', 'Master Key'), ('passkey', 'Passkey')],
+        default='master_key'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'zk_two_factor_login_sessions'
+        verbose_name = '2FA Login Session'
+        verbose_name_plural = '2FA Login Sessions'
+        ordering = ['-created_at']
+    
+    @property
+    def is_expired(self):
+        from datetime import timedelta
+        return timezone.now() > (self.created_at + timedelta(minutes=5))
+    
+    @property
+    def is_valid(self):
+        return not self.is_expired
+    
+    def __str__(self):
+        return f"2FA Login Session for {self.user.id}"
+
+
+class ZKTwoFactorAuth(models.Model):
+    """
+    Two-Factor Authentication (TOTP) for ZK Users
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.OneToOneField(
+        ZKUser,
+        on_delete=models.CASCADE,
+        related_name='two_factor_auth'
+    )
+    
+    # TOTP secret key (encrypted or hashed)
+    totp_secret = models.CharField(
+        max_length=255,
+        help_text="TOTP secret key for generating codes"
+    )
+    
+    # Whether 2FA is enabled
+    is_enabled = models.BooleanField(
+        default=False,
+        help_text="Whether 2FA is currently enabled"
+    )
+    
+    # Backup codes (encrypted)
+    backup_codes = models.TextField(
+        null=True,
+        blank=True,
+        help_text="JSON array of backup codes (encrypted)"
+    )
+    
+    # Metadata
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    last_used = models.DateTimeField(null=True, blank=True)
+    
+    class Meta:
+        db_table = 'zk_two_factor_auth'
+        verbose_name = 'Two-Factor Authentication'
+        verbose_name_plural = 'Two-Factor Authentications'
+    
+    def __str__(self):
+        return f"2FA for {self.user.id} ({'Enabled' if self.is_enabled else 'Disabled'})"

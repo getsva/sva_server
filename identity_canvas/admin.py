@@ -3,7 +3,11 @@ from .models import (
     IdentityCanvas, 
     CanvasHistory, 
     VerifiableBlockOTP, 
-    VerifiedBlock,UsernameProof
+    VerifiedBlock,
+    UsernameProof,
+    AadhaarVerificationSession,
+    UniquenessProof,
+    PANUniquenessProof,
 )
 
 
@@ -54,3 +58,57 @@ class UsernameProofAdmin(admin.ModelAdmin):
     list_filter = ['created_at', 'updated_at']
     readonly_fields = ['id', 'proof_hash', 'prefix', 'username_hash', 'created_at', 'updated_at']
     search_fields = ['user__id', 'proof_hash', 'prefix', 'username_hash']
+
+
+@admin.register(AadhaarVerificationSession)
+class AadhaarVerificationSessionAdmin(admin.ModelAdmin):
+    list_display = ['reference_id', 'user', 'status', 'sandbox_message', 'created_at', 'verified_at']
+    list_filter = ['status', 'created_at']
+    readonly_fields = ['id', 'reference_id', 'aadhaar_hash', 'aadhaar_hash_with_pepper', 'sandbox_transaction_id', 'sandbox_message', 'sandbox_metadata', 'simulated_otp', 'created_at', 'updated_at', 'verified_at']
+    search_fields = ['reference_id', 'user__id', 'aadhaar_hash']
+    
+    def has_change_permission(self, request, obj=None):
+        """Prevent editing verification sessions for security"""
+        return False
+
+
+@admin.register(UniquenessProof)
+class UniquenessProofAdmin(admin.ModelAdmin):
+    """
+    Admin for Aadhaar Uniqueness Proof (Zero-Knowledge)
+    Stores only hashes, never the actual Aadhaar number
+    """
+    list_display = ['id', 'final_hash', 'prefix', 'aadhaar_hash', 'created_at']
+    list_filter = ['created_at']
+    readonly_fields = ['id', 'final_hash', 'prefix', 'aadhaar_hash', 'created_at']
+    search_fields = ['final_hash', 'prefix', 'aadhaar_hash']
+    
+    def has_add_permission(self, request):
+        """Prevent manual addition - only created programmatically"""
+        return False
+    
+    def has_change_permission(self, request, obj=None):
+        """Prevent editing uniqueness proofs for security"""
+        return False
+
+
+@admin.register(PANUniquenessProof)
+class PANUniquenessProofAdmin(admin.ModelAdmin):
+    """
+    Admin for PAN Uniqueness Proof (Zero-Knowledge)
+    Stores only hashes, never the actual PAN number
+    """
+    list_display = ['id', 'final_hash', 'prefix', 'pan_hash', 'created_at']
+    list_filter = ['created_at']
+    readonly_fields = ['id', 'final_hash', 'prefix', 'pan_hash', 'created_at']
+    search_fields = ['final_hash', 'prefix', 'pan_hash']
+    
+    def has_add_permission(self, request):
+        """Prevent manual addition - only created programmatically"""
+        return False
+    
+    def has_change_permission(self, request, obj=None):
+        """Prevent editing uniqueness proofs for security"""
+        return False
+
+    

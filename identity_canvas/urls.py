@@ -6,18 +6,16 @@ from .views import (
     DeleteCanvasView,
     GetCanvasHistoryView,
     RestoreCanvasVersionView,
-    RequestOTPView,
-    VerifyOTPView,
-    CheckVerificationStatusView,
-    GetVerifiedBlocksView,
-    RequestDocumentVerificationView,
-    VerifyDocumentView,
-    GetDocumentVerificationStatusView,
-    GetDocumentVerificationsView,
+    GetVerificationCanvasView,
+    CreateVerificationCanvasView,
+    UpdateVerificationCanvasView,
+    DeleteVerificationCanvasView,
+    GetVerificationCanvasHistoryView,
+    RestoreVerificationCanvasVersionView,
     CheckUsernamePrefixView,
     RegisterUsernameView,
     UpdateUsernameView,
-    DeleteUsernameView
+    DeleteUsernameView,
 )
 
 urlpatterns = [
@@ -36,18 +34,14 @@ urlpatterns = [
     # History
     path('canvas/history/', GetCanvasHistoryView.as_view(), name='get_history'),
     path('canvas/restore/', RestoreCanvasVersionView.as_view(), name='restore_version'),
-    
-    # Verification (Zero-Knowledge OTP)
-    path('verification/request-otp/', RequestOTPView.as_view(), name='request_otp'),
-    path('verification/verify-otp/', VerifyOTPView.as_view(), name='verify_otp'),
-    path('verification/check-status/', CheckVerificationStatusView.as_view(), name='check_verification_status'),
-    path('verification/verified-blocks/', GetVerifiedBlocksView.as_view(), name='get_verified_blocks'),
-    
-    # Document Verification
-    path('verification/document/request/', RequestDocumentVerificationView.as_view(), name='request_document_verification'),
-    path('verification/document/verify/', VerifyDocumentView.as_view(), name='verify_document'),
-    path('verification/document/<uuid:verification_id>/', GetDocumentVerificationStatusView.as_view(), name='get_document_verification_status'),
-    path('verification/document/all/', GetDocumentVerificationsView.as_view(), name='get_document_verifications'),
+
+    # Verification canvas endpoints
+    path('verification-canvas/', GetVerificationCanvasView.as_view(), name='get_verification_canvas'),
+    path('verification-canvas/create/', CreateVerificationCanvasView.as_view(), name='create_verification_canvas'),
+    path('verification-canvas/update/', UpdateVerificationCanvasView.as_view(), name='update_verification_canvas'),
+    path('verification-canvas/delete/', DeleteVerificationCanvasView.as_view(), name='delete_verification_canvas'),
+    path('verification-canvas/history/', GetVerificationCanvasHistoryView.as_view(), name='get_verification_history'),
+    path('verification-canvas/restore/', RestoreVerificationCanvasVersionView.as_view(), name='restore_verification_version'),
     
     # Username Uniqueness (Zero-Knowledge)
     path('username/check-prefix/', CheckUsernamePrefixView.as_view(), name='check_username_prefix'),

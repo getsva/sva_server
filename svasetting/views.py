@@ -11,7 +11,8 @@ from .models import (
     UserIdentityLevel,
     ConnectedService,
     UserPreferences,
-    SecurityLog
+    SecurityLog,
+    UserAppConnection
 )
 from .serializers import (
     IdentityLevelSerializer,
@@ -21,7 +22,10 @@ from .serializers import (
     VerifyIdentitySerializer,
     ConnectServiceSerializer,
     RevokeServiceSerializer,
-    ChangePasswordSerializer
+    ChangePasswordSerializer,
+    UserAppConnectionSerializer,
+    UpdateAppScopesSerializer,
+    RevokeAppConnectionSerializer
 )
 
 
@@ -406,3 +410,200 @@ class GetSecurityLogsView(APIView):
             'limit': limit,
             'offset': offset
         })
+
+
+class ListAppConnectionsView(APIView):
+    """
+    List all app connections for the authenticated user
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        # Get active connections by default, but allow filtering
+        include_revoked = request.query_params.get('include_revoked', 'false').lower() == 'true'
+        
+        queryset = UserAppConnection.objects.filter(user=request.user)
+        if not include_revoked:
+            queryset = queryset.filter(is_active=True)
+        
+        connections = queryset.order_by('-connected_at')
+        
+        return Response({
+            'connections': UserAppConnectionSerializer(connections, many=True).data,
+            'total': connections.count()
+        })
+
+
+class GetAppConnectionView(APIView):
+    """
+    Get details of a specific app connection
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request, connection_id):
+        try:
+            connection = UserAppConnection.objects.get(
+                id=connection_id,
+                user=request.user
+            )
+            return Response(UserAppConnectionSerializer(connection).data)
+        except UserAppConnection.DoesNotExist:
+            return Response(
+                {'error': 'App connection not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+
+class UpdateAppScopesView(APIView):
+    """
+    Update approved scopes for an app connection
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def patch(self, request, connection_id):
+        serializer = UpdateAppScopesSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        try:
+            connection = UserAppConnection.objects.get(
+                id=connection_id,
+                user=request.user,
+                is_active=True
+            )
+        except UserAppConnection.DoesNotExist:
+            return Response(
+                {'error': 'App connection not found or revoked'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        new_scopes = serializer.validated_data['scopes']
+        connection.update_scopes(new_scopes)
+        
+        # Log the action
+        SecurityLog.objects.create(
+            user=request.user,
+            log_type='app_scopes_updated',
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT')
+        )
+        
+        return Response({
+            'message': 'App scopes updated successfully',
+            'connection': UserAppConnectionSerializer(connection).data
+        })
+
+
+class RevokeAppConnectionView(APIView):
+    """
+    Revoke access for an app connection
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request, connection_id):
+        try:
+            connection = UserAppConnection.objects.get(
+                id=connection_id,
+                user=request.user
+            )
+            
+            if not connection.is_active:
+                return Response(
+                    {'error': 'App connection already revoked'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            connection.revoke()
+            
+            # Log the action
+            SecurityLog.objects.create(
+                user=request.user,
+                log_type='app_revoked',
+                ip_address=request.META.get('REMOTE_ADDR'),
+                user_agent=request.META.get('HTTP_USER_AGENT')
+            )
+            
+            return Response({
+                'message': 'App access revoked successfully',
+                'connection': UserAppConnectionSerializer(connection).data
+            })
+            
+        except UserAppConnection.DoesNotExist:
+            return Response(
+                {'error': 'App connection not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+
+class RestoreAppConnectionView(APIView):
+    """
+    Restore/Re-enable a revoked app connection
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request, connection_id):
+        try:
+            connection = UserAppConnection.objects.get(
+                id=connection_id,
+                user=request.user
+            )
+            
+            if connection.is_active:
+                return Response(
+                    {'error': 'App connection is already active'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Restore the connection
+            connection.is_active = True
+            connection.revoked_at = None
+            connection.last_accessed = timezone.now()
+            connection.save(update_fields=['is_active', 'revoked_at', 'last_accessed'])
+            
+            # Log the action
+            SecurityLog.objects.create(
+                user=request.user,
+                log_type='app_connected',  # Reconnection
+                ip_address=request.META.get('REMOTE_ADDR'),
+                user_agent=request.META.get('HTTP_USER_AGENT')
+            )
+            
+            return Response({
+                'message': 'App access restored successfully',
+                'connection': UserAppConnectionSerializer(connection).data
+            })
+            
+        except UserAppConnection.DoesNotExist:
+            return Response(
+                {'error': 'App connection not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+
+class GetAppConnectionByClientIdView(APIView):
+    """
+    Get app connection by client_id (for consent flow)
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        client_id = request.query_params.get('client_id')
+        if not client_id:
+            return Response(
+                {'error': 'client_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            connection = UserAppConnection.objects.get(
+                client_id=client_id,
+                user=request.user,
+                is_active=True
+            )
+            return Response({
+                'exists': True,
+                'connection': UserAppConnectionSerializer(connection).data
+            })
+        except UserAppConnection.DoesNotExist:
+            return Response({
+                'exists': False
+            })

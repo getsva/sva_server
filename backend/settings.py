@@ -109,6 +109,7 @@ INSTALLED_APPS = [
     'authentication',
     'svasetting',
     'identity_canvas',
+    'verifications',
 ]
 
 MIDDLEWARE = [
@@ -293,4 +294,26 @@ SVA_PUBLIC_PEPPER = env(
 SVA_SECRET_SERVER_PEPPER = env(
     'SVA_SECRET_SERVER_PEPPER',
     default='sva-secret-server-pepper-2024-never-expose-this-value'
+)
+
+# --- Sandbox Verification Settings ---
+SANDBOX_API_BASE_URL = env('SANDBOX_API_BASE_URL', default='')
+SANDBOX_API_KEY = env('SANDBOX_API_KEY', default='')
+SANDBOX_API_SECRET = env('SANDBOX_API_SECRET', default='')
+SANDBOX_ACCESS_TOKEN = env('SANDBOX_ACCESS_TOKEN', default='')
+SANDBOX_API_VERSION = env('SANDBOX_API_VERSION', default='')
+SANDBOX_API_TIMEOUT = env.int('SANDBOX_API_TIMEOUT', default=30)
+SANDBOX_VERIFICATION_ENDPOINT = env('SANDBOX_VERIFICATION_ENDPOINT', default='/kyc/verify')
+SANDBOX_AADHAAR_GENERATE_ENDPOINT = env(
+    'SANDBOX_AADHAAR_GENERATE_ENDPOINT',
+    default='/kyc/aadhaar/okyc/otp'
+)
+SANDBOX_AADHAAR_VERIFY_ENDPOINT = env(
+    'SANDBOX_AADHAAR_VERIFY_ENDPOINT',
+    default='/kyc/aadhaar/okyc/otp/verify'
+)
+SANDBOX_AUTH_ENDPOINT = env('SANDBOX_AUTH_ENDPOINT', default='/authenticate')
+SANDBOX_ALLOW_MOCK_FALLBACK = env.bool(
+    'SANDBOX_ALLOW_MOCK_FALLBACK',
+    default=IS_DEVELOPMENT
 )

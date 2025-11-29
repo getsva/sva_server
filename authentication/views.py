@@ -5,6 +5,10 @@ import hashlib
 import hmac
 import logging
 import uuid
+import pyotp
+import qrcode
+import io
+import json
 
 import requests
 from django.conf import settings
@@ -17,7 +21,9 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import ZKUser, ZKRefreshToken, ZKEmailVerificationToken
+from .models import ZKUser, ZKRefreshToken, ZKEmailVerificationToken, ZKTwoFactorAuth, ZKTwoFactorLoginSession, ZKTwoFactorLoginSession
+from identity_canvas.models import IdentityCanvas, CanvasHistory, VerificationCanvas, VerificationCanvasHistory
+from svasetting.models import UserPreferences, ConnectedService, UserIdentityLevel
 from .serializers import (
     ZKRegisterSerializer, 
     ZKLoginSerializer, 
@@ -31,6 +37,11 @@ from .serializers import (
     ZKEmailVerificationConfirmSerializer,
     ZKEmailLoginSerializer,
     ZKGetSaltByEmailSerializer,
+    ZKChangeMasterKeySerializer,
+    ZKTwoFactorSetupSerializer,
+    ZKTwoFactorVerifySerializer,
+    ZKTwoFactorDisableSerializer,
+    ZKTwoFactorLoginVerifySerializer,
 )
 from .token_utils import generate_access_token, generate_refresh_token, generate_data_token
 
@@ -282,6 +293,108 @@ class ZKGetUserDataView(APIView):
     def get(self, request):
         serializer = ZKUserDataSerializer(request.user)
         return Response(serializer.data)
+
+
+class ZKGetAllEncryptedDataView(APIView):
+    """
+    Returns all encrypted data for a user (for master key rotation)
+    This endpoint is used to fetch all encrypted data that needs to be re-encrypted
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        user = request.user
+        
+        # Get user's main encrypted data
+        user_data = {
+            'encrypted_data': user.encrypted_data,
+            'salt': user.salt,
+        }
+        
+        # Get identity canvas
+        canvas_data = None
+        canvas_history = []
+        try:
+            canvas = IdentityCanvas.objects.get(user=user)
+            canvas_data = {
+                'id': str(canvas.id),
+                'encrypted_blocks': canvas.encrypted_blocks,
+            }
+            # Get all canvas history entries
+            history_entries = CanvasHistory.objects.filter(canvas=canvas)
+            canvas_history = [
+                {
+                    'id': str(entry.id),
+                    'encrypted_blocks_snapshot': entry.encrypted_blocks_snapshot,
+                }
+                for entry in history_entries
+            ]
+        except IdentityCanvas.DoesNotExist:
+            pass
+        
+        # Get verification canvas
+        verification_canvas_data = None
+        verification_canvas_history = []
+        try:
+            verification_canvas = VerificationCanvas.objects.get(user=user)
+            verification_canvas_data = {
+                'id': str(verification_canvas.id),
+                'encrypted_blocks': verification_canvas.encrypted_blocks,
+            }
+            # Get all verification canvas history entries
+            verification_history_entries = VerificationCanvasHistory.objects.filter(canvas=verification_canvas)
+            verification_canvas_history = [
+                {
+                    'id': str(entry.id),
+                    'encrypted_blocks_snapshot': entry.encrypted_blocks_snapshot,
+                }
+                for entry in verification_history_entries
+            ]
+        except VerificationCanvas.DoesNotExist:
+            pass
+        
+        # Get user preferences
+        preferences_data = None
+        try:
+            preferences = UserPreferences.objects.get(user=user)
+            preferences_data = {
+                'id': str(preferences.id),
+                'encrypted_preferences': preferences.encrypted_preferences,
+            }
+        except UserPreferences.DoesNotExist:
+            pass
+        
+        # Get connected services
+        connected_services = []
+        services = ConnectedService.objects.filter(user=user, is_active=True)
+        for service in services:
+            connected_services.append({
+                'id': str(service.id),
+                'encrypted_service_data': service.encrypted_service_data,
+                'encrypted_permissions': service.encrypted_permissions or '',
+            })
+        
+        # Get identity level
+        identity_level_data = None
+        try:
+            identity_level = UserIdentityLevel.objects.get(user=user)
+            identity_level_data = {
+                'id': str(identity_level.id),
+                'encrypted_verification_data': identity_level.encrypted_verification_data or '',
+            }
+        except UserIdentityLevel.DoesNotExist:
+            pass
+        
+        return Response({
+            'user_data': user_data,
+            'canvas': canvas_data,
+            'canvas_history': canvas_history,
+            'verification_canvas': verification_canvas_data,
+            'verification_canvas_history': verification_canvas_history,
+            'preferences': preferences_data,
+            'connected_services': connected_services,
+            'identity_level': identity_level_data,
+        })
 
 
 class ZKUpdateUserDataView(APIView):
@@ -655,6 +768,43 @@ class AuthRequestDetailProxyView(AuthServerClientMixin, APIView):
             return Response(payload, status=response.status_code)
 
         payload = response.json()
+        
+        # Check if user has existing connection for instant approval (Google OAuth style)
+        try:
+            from svasetting.models import UserAppConnection
+            client_id = payload.get('client', {}).get('client_id')
+            if client_id:
+                try:
+                    connection = UserAppConnection.objects.get(
+                        user=request.user,
+                        client_id=client_id,
+                        is_active=True
+                    )
+                    existing_scopes = set(connection.approved_scopes or [])
+                    requested_scopes = set(payload.get('requested_scopes', []))
+                    
+                    # If all requested scopes were previously approved, mark for auto-approval
+                    if requested_scopes and requested_scopes.issubset(existing_scopes):
+                        payload['can_auto_approve'] = True
+                        payload['existing_connection'] = {
+                            'id': str(connection.id),
+                            'approved_scopes': connection.approved_scopes,
+                            'connected_at': connection.connected_at.isoformat(),
+                        }
+                    else:
+                        payload['can_auto_approve'] = False
+                        payload['existing_connection'] = {
+                            'id': str(connection.id),
+                            'approved_scopes': connection.approved_scopes,
+                        }
+                except UserAppConnection.DoesNotExist:
+                    payload['can_auto_approve'] = False
+                    payload['existing_connection'] = None
+        except Exception as exc:
+            # Don't fail the request if connection check fails
+            logger.debug('Failed to check existing connection: %s', exc)
+            payload['can_auto_approve'] = False
+        
         return Response(payload)
 
 
@@ -676,6 +826,21 @@ class AuthRequestConsentProxyView(AuthServerClientMixin, APIView):
         serializer = ConsentCompletionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+
+        # Initialize client_info with empty dict (will be populated if fetch succeeds)
+        client_info = {}
+        
+        # First, fetch auth request details to get app information
+        try:
+            auth_request_response = self._fetch_auth_request(auth_request_id)
+            if auth_request_response.status_code == status.HTTP_200_OK:
+                auth_request_data = auth_request_response.json()
+                client_info = auth_request_data.get('client', {})
+            else:
+                logger.warning('Failed to fetch auth request details: %s', auth_request_response.text)
+        except RequestException as exc:
+            logger.warning('Failed to fetch auth request details: %s', exc)
+            client_info = {}
 
         payload = {
             'auth_request_id': str(auth_request_id),
@@ -701,7 +866,74 @@ class AuthRequestConsentProxyView(AuthServerClientMixin, APIView):
                 payload = {'error': 'unexpected_response'}
             return Response(payload, status=response.status_code)
 
+        # Create or update UserAppConnection after successful consent
+        try:
+            self._create_or_update_app_connection(
+                user=request.user,
+                client_id=client_info.get('client_id'),
+                app_name=client_info.get('name', 'Unknown App'),
+                app_logo=client_info.get('logo'),
+                app_description=client_info.get('description'),
+                approved_scopes=data.get('approved_scopes', []),
+            )
+        except Exception as exc:
+            # Log but don't fail the consent flow if connection tracking fails
+            logger.error('Failed to create/update app connection: %s', exc, exc_info=True)
+
         return Response(response.json())
+    
+    def _create_or_update_app_connection(self, user, client_id, app_name, app_logo=None, app_description=None, approved_scopes=None):
+        """Create or update UserAppConnection after consent"""
+        if not client_id:
+            return
+        
+        from svasetting.models import UserAppConnection, SecurityLog
+        from django.utils import timezone
+        
+        try:
+            connection = UserAppConnection.objects.get(user=user, client_id=client_id)
+            # Connection exists - update it
+            connection.app_name = app_name
+            if app_logo:
+                connection.app_logo = app_logo
+            if app_description:
+                connection.app_description = app_description
+            connection.is_active = True
+            connection.revoked_at = None
+            connection.last_accessed = timezone.now()
+            
+            # Only update scopes if they changed
+            if approved_scopes and set(connection.approved_scopes) != set(approved_scopes):
+                connection.update_scopes(approved_scopes)
+            else:
+                connection.save(update_fields=['app_name', 'app_logo', 'app_description', 'is_active', 'revoked_at', 'last_accessed'])
+            
+            # Log the action (only log scope update if scopes actually changed)
+            if approved_scopes and set(connection.approved_scopes) != set(approved_scopes):
+                log_type = 'app_scopes_updated'
+            else:
+                log_type = 'app_connected'  # Reconnection
+        except UserAppConnection.DoesNotExist:
+            # Create new connection
+            connection = UserAppConnection.objects.create(
+                user=user,
+                client_id=client_id,
+                app_name=app_name,
+                app_logo=app_logo or '',
+                app_description=app_description or '',
+                approved_scopes=approved_scopes or [],
+                is_active=True,
+                last_accessed=timezone.now(),
+            )
+            log_type = 'app_connected'
+        
+        # Log the action
+        SecurityLog.objects.create(
+            user=user,
+            log_type=log_type,
+            ip_address=None,  # Could be passed from request if needed
+            user_agent=None,
+        )
 
 
 # ==================== EMAIL VERIFICATION VIEWS ====================
@@ -914,6 +1146,27 @@ class ZKEmailLoginView(generics.GenericAPIView):
                 status=status.HTTP_401_UNAUTHORIZED
             )
         
+        # Check if 2FA is enabled
+        try:
+            two_fa = ZKTwoFactorAuth.objects.get(user=zk_user, is_enabled=True)
+            # 2FA is enabled - create temporary session and require 2FA verification
+            temp_session = ZKTwoFactorLoginSession.objects.create(
+                user=zk_user,
+                encrypted_data=zk_user.encrypted_data,
+                salt=zk_user.salt,
+                device_fingerprint=device_fingerprint,
+                auth_method='passkey' if zk_user.has_passkey else 'master_key'
+            )
+            
+            return Response({
+                "requires_2fa": True,
+                "temp_token": str(temp_session.temp_token),
+                "message": "2FA verification required"
+            }, status=status.HTTP_200_OK)
+        except ZKTwoFactorAuth.DoesNotExist:
+            # 2FA not enabled - proceed with normal login
+            pass
+        
         # Update last login
         zk_user.last_login = timezone.now()
         zk_user.save(update_fields=['last_login'])
@@ -931,5 +1184,441 @@ class ZKEmailLoginView(generics.GenericAPIView):
             "user": ZKUserDetailsSerializer(zk_user).data,
             "encrypted_data": zk_user.encrypted_data,
             "salt": zk_user.salt,
-            "auth_method": auth_method
+            "auth_method": auth_method,
+            "requires_2fa": False
         })
+
+# ==================== SECURITY MANAGEMENT VIEWS ====================
+
+class ZKChangeMasterKeyView(APIView):
+    """
+    Change master key for user account
+    Requires current master key verification
+    Re-encrypts all user data with the new master key
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request):
+        from django.db import transaction
+        
+        serializer = ZKChangeMasterKeySerializer(
+            data=request.data,
+            context={'user': request.user}
+        )
+        serializer.is_valid(raise_exception=True)
+        
+        # Verify current auth proof
+        if request.user.auth_proof != serializer.validated_data['current_auth_proof']:
+            return Response(
+                {'error': 'Invalid current master key'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+        
+        # Check if new auth proof already exists (different user)
+        if ZKUser.objects.filter(auth_proof=serializer.validated_data['new_auth_proof']).exclude(id=request.user.id).exists():
+            return Response(
+                {'error': 'This master key is already in use by another account'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Use transaction to ensure all data is updated atomically
+        with transaction.atomic():
+            # Update user with new master key data
+            request.user.encrypted_data = serializer.validated_data['new_encrypted_data']
+            request.user.salt = serializer.validated_data['new_salt']
+            request.user.auth_proof = serializer.validated_data['new_auth_proof']
+            request.user.updated_at = timezone.now()
+            request.user.save(update_fields=['encrypted_data', 'salt', 'auth_proof', 'updated_at'])
+            
+            # Update identity canvas if provided
+            if serializer.validated_data.get('new_canvas_encrypted_blocks'):
+                try:
+                    canvas = IdentityCanvas.objects.get(user=request.user)
+                    canvas.encrypted_blocks = serializer.validated_data['new_canvas_encrypted_blocks']
+                    canvas.save(update_fields=['encrypted_blocks', 'updated_at'])
+                except IdentityCanvas.DoesNotExist:
+                    pass
+            
+            # Update canvas history if provided
+            if serializer.validated_data.get('new_canvas_history'):
+                try:
+                    canvas = IdentityCanvas.objects.get(user=request.user)
+                    for history_entry in serializer.validated_data['new_canvas_history']:
+                        try:
+                            history = CanvasHistory.objects.get(
+                                id=history_entry.get('id'),
+                                canvas=canvas
+                            )
+                            history.encrypted_blocks_snapshot = history_entry.get('encrypted_blocks_snapshot', '')
+                            history.save(update_fields=['encrypted_blocks_snapshot'])
+                        except CanvasHistory.DoesNotExist:
+                            pass
+                except IdentityCanvas.DoesNotExist:
+                    pass
+            
+            # Update verification canvas if provided
+            if serializer.validated_data.get('new_verification_canvas_encrypted_blocks'):
+                try:
+                    verification_canvas = VerificationCanvas.objects.get(user=request.user)
+                    verification_canvas.encrypted_blocks = serializer.validated_data['new_verification_canvas_encrypted_blocks']
+                    verification_canvas.save(update_fields=['encrypted_blocks', 'updated_at'])
+                except VerificationCanvas.DoesNotExist:
+                    pass
+            
+            # Update verification canvas history if provided
+            if serializer.validated_data.get('new_verification_canvas_history'):
+                try:
+                    verification_canvas = VerificationCanvas.objects.get(user=request.user)
+                    for history_entry in serializer.validated_data['new_verification_canvas_history']:
+                        try:
+                            history = VerificationCanvasHistory.objects.get(
+                                id=history_entry.get('id'),
+                                canvas=verification_canvas
+                            )
+                            history.encrypted_blocks_snapshot = history_entry.get('encrypted_blocks_snapshot', '')
+                            history.save(update_fields=['encrypted_blocks_snapshot'])
+                        except VerificationCanvasHistory.DoesNotExist:
+                            pass
+                except VerificationCanvas.DoesNotExist:
+                    pass
+            
+            # Update preferences if provided
+            if serializer.validated_data.get('new_preferences_encrypted') is not None:
+                preferences, _ = UserPreferences.objects.get_or_create(user=request.user)
+                preferences.encrypted_preferences = serializer.validated_data['new_preferences_encrypted']
+                preferences.save(update_fields=['encrypted_preferences', 'updated_at'])
+            
+            # Update connected services if provided
+            if serializer.validated_data.get('new_connected_services'):
+                for service_data in serializer.validated_data['new_connected_services']:
+                    try:
+                        service = ConnectedService.objects.get(
+                            id=service_data.get('id'),
+                            user=request.user
+                        )
+                        if 'encrypted_service_data' in service_data:
+                            service.encrypted_service_data = service_data['encrypted_service_data']
+                        if 'encrypted_permissions' in service_data:
+                            service.encrypted_permissions = service_data.get('encrypted_permissions', '')
+                        service.save(update_fields=['encrypted_service_data', 'encrypted_permissions'])
+                    except ConnectedService.DoesNotExist:
+                        pass
+            
+            # Update identity level if provided
+            if serializer.validated_data.get('new_identity_level_encrypted') is not None:
+                identity_level, _ = UserIdentityLevel.objects.get_or_create(user=request.user)
+                identity_level.encrypted_verification_data = serializer.validated_data['new_identity_level_encrypted']
+                identity_level.save(update_fields=['encrypted_verification_data', 'updated_at'])
+        
+        return Response({
+            'message': 'Master key changed successfully. All data has been re-encrypted.',
+            'user': ZKUserDetailsSerializer(request.user).data
+        }, status=status.HTTP_200_OK)
+
+
+class ZKTwoFactorSetupView(APIView):
+    """
+    Setup 2FA for user account
+    Returns QR code and secret for authenticator app
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        # Get or create 2FA record
+        two_fa, created = ZKTwoFactorAuth.objects.get_or_create(user=request.user)
+        
+        # Generate new secret if not already set or if resetting
+        if not two_fa.totp_secret or not two_fa.is_enabled:
+            two_fa.totp_secret = pyotp.random_base32()
+            two_fa.is_enabled = False
+            two_fa.save()
+        
+        # Generate provisioning URI
+        totp = pyotp.TOTP(two_fa.totp_secret)
+        provisioning_uri = totp.provisioning_uri(
+            name=str(request.user.id),
+            issuer_name="SVA"
+        )
+        
+        # Generate QR code
+        qr = qrcode.QRCode(version=1, box_size=10, border=5)
+        qr.add_data(provisioning_uri)
+        qr.make(fit=True)
+        
+        img = qr.make_image(fill_color="black", back_color="white")
+        buffer = io.BytesIO()
+        img.save(buffer, format='PNG')
+        qr_code_data = base64.b64encode(buffer.getvalue()).decode()
+        
+        return Response({
+            'secret': two_fa.totp_secret,
+            'qr_code': f'data:image/png;base64,{qr_code_data}',
+            'provisioning_uri': provisioning_uri,
+            'is_enabled': two_fa.is_enabled
+        }, status=status.HTTP_200_OK)
+    
+    def post(self, request):
+        serializer = ZKTwoFactorSetupSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        two_fa, _ = ZKTwoFactorAuth.objects.get_or_create(user=request.user)
+        
+        if not two_fa.totp_secret:
+            return Response(
+                {'error': '2FA not initialized. Please call GET first.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Verify TOTP code
+        totp_code = serializer.validated_data.get('totp_code')
+        if totp_code:
+            totp = pyotp.TOTP(two_fa.totp_secret)
+            if not totp.verify(totp_code, valid_window=1):
+                return Response(
+                    {'error': 'Invalid TOTP code'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Generate backup codes
+            backup_codes = [pyotp.random_base32()[:8].upper() for _ in range(10)]
+            two_fa.backup_codes = json.dumps(backup_codes)
+            two_fa.is_enabled = True
+            two_fa.save()
+            
+            return Response({
+                'message': '2FA enabled successfully',
+                'backup_codes': backup_codes,
+                'is_enabled': True
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            'message': '2FA setup initiated. Verify with TOTP code to enable.',
+            'is_enabled': False
+        }, status=status.HTTP_200_OK)
+
+
+class ZKTwoFactorStatusView(APIView):
+    """
+    Get 2FA status for current user
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        try:
+            two_fa = ZKTwoFactorAuth.objects.get(user=request.user)
+            return Response({
+                'is_enabled': two_fa.is_enabled,
+                'has_backup_codes': bool(two_fa.backup_codes)
+            }, status=status.HTTP_200_OK)
+        except ZKTwoFactorAuth.DoesNotExist:
+            return Response({
+                'is_enabled': False,
+                'has_backup_codes': False
+            }, status=status.HTTP_200_OK)
+
+
+class ZKTwoFactorDisableView(APIView):
+    """
+    Disable 2FA for user account
+    Requires master key verification and TOTP code
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request):
+        serializer = ZKTwoFactorDisableSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        # Verify auth proof
+        if request.user.auth_proof != serializer.validated_data['auth_proof']:
+            return Response(
+                {'error': 'Invalid master key verification'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+        
+        try:
+            two_fa = ZKTwoFactorAuth.objects.get(user=request.user, is_enabled=True)
+        except ZKTwoFactorAuth.DoesNotExist:
+            return Response(
+                {'error': '2FA is not enabled'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Verify TOTP code
+        totp = pyotp.TOTP(two_fa.totp_secret)
+        totp_code = serializer.validated_data['totp_code']
+        
+        # Check backup codes too
+        backup_codes = json.loads(two_fa.backup_codes) if two_fa.backup_codes else []
+        is_valid_backup = totp_code in backup_codes
+        
+        if not totp.verify(totp_code, valid_window=1) and not is_valid_backup:
+            return Response(
+                {'error': 'Invalid TOTP code'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Remove used backup code if applicable
+        if is_valid_backup:
+            backup_codes.remove(totp_code)
+            two_fa.backup_codes = json.dumps(backup_codes) if backup_codes else None
+        
+        # Disable 2FA
+        two_fa.is_enabled = False
+        two_fa.save()
+        
+        return Response({
+            'message': '2FA disabled successfully'
+        }, status=status.HTTP_200_OK)
+
+
+class ZKActiveSessionsView(APIView):
+    """
+    Get and manage active sessions for user
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        # Get all active refresh tokens for user
+        active_tokens = ZKRefreshToken.objects.filter(
+            user=request.user,
+            expires_at__gt=timezone.now()
+        ).order_by('-created_at')
+        
+        sessions = []
+        current_token = request.headers.get('Authorization', '').replace('Bearer ', '')
+        
+        for token in active_tokens:
+            # Try to get access token from request to identify current session
+            is_current = False
+            try:
+                from .token_utils import get_user_from_token
+                user_from_token = get_user_from_token(current_token)
+                if user_from_token and user_from_token.id == request.user.id:
+                    is_current = True
+            except:
+                pass
+            
+            sessions.append({
+                'id': str(token.id),
+                'created_at': token.created_at.isoformat(),
+                'expires_at': token.expires_at.isoformat(),
+                'auth_method': token.auth_method,
+                'device_fingerprint': token.device_fingerprint[:8] + '...' if token.device_fingerprint else None,
+                'device_info': token.device_info,
+                'ip_address': str(token.ip_address) if token.ip_address else None,
+                'is_current': is_current
+            })
+        
+        return Response({
+            'sessions': sessions,
+            'total': len(sessions)
+        }, status=status.HTTP_200_OK)
+    
+    def delete(self, request):
+        session_id = request.data.get('session_id')
+        
+        if not session_id:
+            return Response(
+                {'error': 'session_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            token = ZKRefreshToken.objects.get(
+                id=session_id,
+                user=request.user
+            )
+            token.delete()
+            
+            return Response({
+                'message': 'Session revoked successfully'
+            }, status=status.HTTP_200_OK)
+        except ZKRefreshToken.DoesNotExist:
+            return Response(
+                {'error': 'Session not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+
+class ZKTwoFactorLoginVerifyView(APIView):
+    """
+    Verify 2FA code during login and complete authentication
+    """
+    permission_classes = [AllowAny]
+    
+    def post(self, request):
+        serializer = ZKTwoFactorLoginVerifySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        temp_token = serializer.validated_data['temp_token']
+        totp_code = serializer.validated_data['totp_code']
+        
+        try:
+            temp_session = ZKTwoFactorLoginSession.objects.get(temp_token=temp_token)
+        except ZKTwoFactorLoginSession.DoesNotExist:
+            return Response(
+                {'error': 'Invalid or expired temporary token'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not temp_session.is_valid:
+            temp_session.delete()
+            return Response(
+                {'error': 'Temporary session has expired. Please login again.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Verify 2FA code
+        try:
+            two_fa = ZKTwoFactorAuth.objects.get(user=temp_session.user, is_enabled=True)
+        except ZKTwoFactorAuth.DoesNotExist:
+            temp_session.delete()
+            return Response(
+                {'error': '2FA is not enabled for this account'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        totp = pyotp.TOTP(two_fa.totp_secret)
+        backup_codes = json.loads(two_fa.backup_codes) if two_fa.backup_codes else []
+        is_valid_backup = totp_code in backup_codes
+        
+        if not totp.verify(totp_code, valid_window=1) and not is_valid_backup:
+            return Response(
+                {'error': 'Invalid TOTP code'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Remove used backup code if applicable
+        if is_valid_backup:
+            backup_codes.remove(totp_code)
+            two_fa.backup_codes = json.dumps(backup_codes) if backup_codes else None
+            two_fa.save()
+        
+        # Update 2FA last used
+        two_fa.last_used = timezone.now()
+        two_fa.save()
+        
+        # Update last login
+        temp_session.user.last_login = timezone.now()
+        temp_session.user.save(update_fields=['last_login'])
+        
+        # Generate tokens
+        access_token = generate_access_token(temp_session.user)
+        refresh_token = generate_refresh_token(
+            temp_session.user,
+            auth_method=temp_session.auth_method,
+            device_fingerprint=temp_session.device_fingerprint
+        )
+        
+        # Clean up temporary session
+        temp_session.delete()
+        
+        return Response({
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "user": ZKUserDetailsSerializer(temp_session.user).data,
+            "encrypted_data": temp_session.encrypted_data,
+            "salt": temp_session.salt,
+            "auth_method": temp_session.auth_method,
+            "requires_2fa": False
+        }, status=status.HTTP_200_OK)

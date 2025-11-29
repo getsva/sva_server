@@ -90,6 +90,69 @@ class CanvasHistory(models.Model):
         return f"Canvas {self.canvas.id} - Version {self.version}"
 
 
+class VerificationCanvas(models.Model):
+    """
+    Stores encrypted verification blocks (separate from identity canvas).
+    Each user has one verification canvas mirroring the identity canvas lifecycle.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.OneToOneField(
+        ZKUser,
+        on_delete=models.CASCADE,
+        related_name='verification_canvas'
+    )
+
+    encrypted_blocks = models.TextField(
+        help_text="Encrypted JSON array of verification blocks"
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    version = models.IntegerField(default=1)
+
+    class Meta:
+        db_table = 'verification_canvas'
+        verbose_name = 'Verification Canvas'
+        verbose_name_plural = 'Verification Canvases'
+        ordering = ['-updated_at']
+
+    def __str__(self):
+        return f"Verification Canvas for {self.user.id}"
+
+
+class VerificationCanvasHistory(models.Model):
+    """
+    Optional history table for verification canvas updates (audit trail).
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    canvas = models.ForeignKey(
+        VerificationCanvas,
+        on_delete=models.CASCADE,
+        related_name='history'
+    )
+    encrypted_blocks_snapshot = models.TextField()
+    version = models.IntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    action = models.CharField(
+        max_length=50,
+        blank=True,
+        null=True,
+        help_text="Action that created this version (create, update, delete)"
+    )
+
+    class Meta:
+        db_table = 'verification_canvas_history'
+        verbose_name = 'Verification Canvas History'
+        verbose_name_plural = 'Verification Canvas Histories'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['canvas', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f"Verification Canvas {self.canvas.id} - Version {self.version}"
+
+
 # ==================== VERIFICATION SYSTEM (Zero-Knowledge OTP) ====================
 
 class VerificationBlockType(models.TextChoices):
@@ -361,6 +424,162 @@ class UsernameProof(models.Model):
         return username_hash[:8]
 
 
+# ==================== AADHAAR UNIQUENESS PROOF (Zero-Knowledge) ====================
+
+class UniquenessProof(models.Model):
+    """
+    Zero-Knowledge Aadhaar Uniqueness Proof Model
+    
+    Stores cryptographic proof of Aadhaar uniqueness without revealing the actual Aadhaar number.
+    Uses k-anonymity with prefix matching to check global uniqueness while maintaining privacy.
+    
+    Zero-Knowledge Design:
+    - Only stores final_hash (SHA-256(aadhaar_hash + SECRET_PEPPER))
+    - Aadhaar number itself is never stored on server
+    - Uniqueness checking uses prefix matching for k-anonymity
+    - Server cannot reverse the proof to get the Aadhaar number
+    - Not linked to any user - just a global list of used Aadhaar hashes
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Final proof hash: SHA-256(aadhaar_hash + SECRET_PEPPER)
+    # This prevents brute-force attacks while maintaining uniqueness
+    final_hash = models.CharField(
+        max_length=64,
+        unique=True,
+        db_index=True,
+        help_text="SHA-256 hash of (aadhaar_hash + SECRET_PEPPER) for uniqueness proof"
+    )
+    
+    # Hash prefix for k-anonymity lookups (first 5 characters)
+    # Used for efficient prefix-based uniqueness checking
+    prefix = models.CharField(
+        max_length=5,
+        db_index=True,
+        help_text="First 5 characters of aadhaar_hash for prefix matching"
+    )
+    
+    # Store aadhaar_hash for k-anonymity prefix matching
+    # This is needed to return matching hashes to client for local checking
+    # Still maintains zero-knowledge as hash cannot be reversed to get Aadhaar number
+    aadhaar_hash = models.CharField(
+        max_length=64,
+        db_index=True,
+        help_text="SHA-256 hash of Aadhaar number (with public pepper) for prefix matching"
+    )
+    
+    # Metadata
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'uniqueness_proofs'
+        verbose_name = 'Uniqueness Proof'
+        verbose_name_plural = 'Uniqueness Proofs'
+        indexes = [
+            models.Index(fields=['prefix']),
+            models.Index(fields=['final_hash']),
+            models.Index(fields=['aadhaar_hash']),
+        ]
+    
+    def __str__(self):
+        return f"Uniqueness proof {self.prefix}..."
+    
+    @classmethod
+    def generate_final_hash(cls, aadhaar_hash: str, secret_pepper: str) -> str:
+        """
+        Generate final proof hash from aadhaar hash and secret pepper
+        This is what gets stored on the server
+        """
+        combined = f"{aadhaar_hash}{secret_pepper}"
+        return hashlib.sha256(combined.encode()).hexdigest()
+    
+    @classmethod
+    def get_prefix(cls, aadhaar_hash: str) -> str:
+        """
+        Extract prefix from aadhaar hash for k-anonymity lookups
+        Using 5 characters provides good k-anonymity (2^20 possibilities)
+        """
+        return aadhaar_hash[:5]
+
+
+# ==================== PAN UNIQUENESS PROOF (Zero-Knowledge) ====================
+
+class PANUniquenessProof(models.Model):
+    """
+    Zero-Knowledge PAN Uniqueness Proof Model
+    
+    Stores cryptographic proof of PAN uniqueness without revealing the actual PAN number.
+    Uses k-anonymity with prefix matching to check global uniqueness while maintaining privacy.
+    
+    Zero-Knowledge Design:
+    - Only stores final_hash (SHA-256(pan_hash + SECRET_PEPPER))
+    - PAN number itself is never stored on server
+    - Uniqueness checking uses prefix matching for k-anonymity
+    - Server cannot reverse the proof to get the PAN number
+    - Not linked to any user - just a global list of used PAN hashes
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Final proof hash: SHA-256(pan_hash + SECRET_PEPPER)
+    # This prevents brute-force attacks while maintaining uniqueness
+    final_hash = models.CharField(
+        max_length=64,
+        unique=True,
+        db_index=True,
+        help_text="SHA-256 hash of (pan_hash + SECRET_PEPPER) for uniqueness proof"
+    )
+    
+    # Hash prefix for k-anonymity lookups (first 5 characters)
+    # Used for efficient prefix-based uniqueness checking
+    prefix = models.CharField(
+        max_length=5,
+        db_index=True,
+        help_text="First 5 characters of pan_hash for prefix matching"
+    )
+    
+    # Store pan_hash for k-anonymity prefix matching
+    # This is needed to return matching hashes to client for local checking
+    # Still maintains zero-knowledge as hash cannot be reversed to get PAN number
+    pan_hash = models.CharField(
+        max_length=64,
+        db_index=True,
+        help_text="SHA-256 hash of PAN number (with public pepper) for prefix matching"
+    )
+    
+    # Metadata
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'pan_uniqueness_proofs'
+        verbose_name = 'PAN Uniqueness Proof'
+        verbose_name_plural = 'PAN Uniqueness Proofs'
+        indexes = [
+            models.Index(fields=['prefix']),
+            models.Index(fields=['final_hash']),
+            models.Index(fields=['pan_hash']),
+        ]
+    
+    def __str__(self):
+        return f"PAN uniqueness proof {self.prefix}..."
+    
+    @classmethod
+    def generate_final_hash(cls, pan_hash: str, secret_pepper: str) -> str:
+        """
+        Generate final proof hash from pan hash and secret pepper
+        This is what gets stored on the server
+        """
+        combined = f"{pan_hash}{secret_pepper}"
+        return hashlib.sha256(combined.encode()).hexdigest()
+    
+    @classmethod
+    def get_prefix(cls, pan_hash: str) -> str:
+        """
+        Extract prefix from pan hash for k-anonymity lookups
+        Using 5 characters provides good k-anonymity (2^20 possibilities)
+        """
+        return pan_hash[:5]
+
+
 # ==================== SIGNALS ====================
 
 @receiver(post_delete, sender=IdentityCanvas)
@@ -449,4 +668,91 @@ class DocumentVerification(models.Model):
     
     def __str__(self):
         return f"{self.block_type} verification for {self.user.id} - {self.status}"
+
+
+class AadhaarVerificationSession(models.Model):
+    """
+    Stores metadata for Aadhaar OKYC sessions without persisting sensitive PII.
+    Only hashes, reference IDs, and sanitized metadata are stored (zero-knowledge).
+    """
+
+    STATUS_PENDING = 'pending'
+    STATUS_VERIFIED = 'verified'
+    STATUS_FAILED = 'failed'
+
+    STATUS_CHOICES = [
+        (STATUS_PENDING, 'Pending'),
+        (STATUS_VERIFIED, 'Verified'),
+        (STATUS_FAILED, 'Failed'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        ZKUser,
+        on_delete=models.CASCADE,
+        related_name='aadhaar_kyc_sessions',
+        help_text="User that initiated the Aadhaar OKYC flow"
+    )
+    aadhaar_hash = models.CharField(
+        max_length=64,
+        db_index=True,
+        help_text="SHA-256 hash of the Aadhaar number"
+    )
+    aadhaar_hash_with_pepper = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="SHA-256 hash of (Aadhaar number + PUBLIC_PEPPER) for uniqueness proof"
+    )
+    reference_id = models.CharField(
+        max_length=128,
+        unique=True,
+        help_text="Reference ID returned by Sandbox generate OTP API"
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default=STATUS_PENDING,
+        help_text="Latest status from Sandbox"
+    )
+    sandbox_transaction_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        help_text="Sandbox transaction identifier (if provided)"
+    )
+    sandbox_message = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text="Latest message from Sandbox"
+    )
+    sandbox_metadata = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Sanitized metadata returned from Sandbox (no PII)"
+    )
+    simulated_otp = models.CharField(
+        max_length=6,
+        null=True,
+        blank=True,
+        help_text="DEV helper storing OTP when Sandbox is not configured"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    verified_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = 'aadhaar_verification_sessions'
+        verbose_name = 'Aadhaar Verification Session'
+        verbose_name_plural = 'Aadhaar Verification Sessions'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'status']),
+            models.Index(fields=['aadhaar_hash']),
+        ]
+
+    def __str__(self):
+        return f"Aadhaar session {self.reference_id} ({self.status})"
 
