@@ -481,6 +481,7 @@ class ZKGetSaltByEmailSerializer(serializers.Serializer):
 class ZKChangeMasterKeySerializer(serializers.Serializer):
     """
     Serializer for changing master key
+    Now supports re-encryption of all user data
     """
     current_auth_proof = serializers.CharField(
         required=True,
@@ -499,6 +500,51 @@ class ZKChangeMasterKeySerializer(serializers.Serializer):
         required=True,
         max_length=255,
         help_text="New authentication proof derived from new master key"
+    )
+    
+    # Optional: Re-encrypted canvas data
+    new_canvas_encrypted_blocks = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text="Re-encrypted identity canvas blocks"
+    )
+    new_canvas_history = serializers.ListField(
+        child=serializers.DictField(),
+        required=False,
+        help_text="Re-encrypted canvas history entries"
+    )
+    
+    # Optional: Re-encrypted verification canvas data
+    new_verification_canvas_encrypted_blocks = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text="Re-encrypted verification canvas blocks"
+    )
+    new_verification_canvas_history = serializers.ListField(
+        child=serializers.DictField(),
+        required=False,
+        help_text="Re-encrypted verification canvas history entries"
+    )
+    
+    # Optional: Re-encrypted preferences
+    new_preferences_encrypted = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text="Re-encrypted user preferences"
+    )
+    
+    # Optional: Re-encrypted connected services
+    new_connected_services = serializers.ListField(
+        child=serializers.DictField(),
+        required=False,
+        help_text="Re-encrypted connected services data"
+    )
+    
+    # Optional: Re-encrypted identity level
+    new_identity_level_encrypted = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text="Re-encrypted identity level verification data"
     )
     
     def validate_new_salt(self, value):

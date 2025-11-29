@@ -2,6 +2,7 @@ from django.db import models
 from django.utils import timezone
 from authentication.models import ZKUser
 import uuid
+import json
 
 
 class UserIdentityLevel(models.Model):
@@ -81,6 +82,62 @@ class ConnectedService(models.Model):
         return f"{self.user.id} - Service {self.id}"
 
 
+class UserAppConnection(models.Model):
+    """
+    Tracks OAuth app connections where user has consented to share data
+    This is separate from ConnectedService - this is specifically for OAuth apps
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(ZKUser, on_delete=models.CASCADE, related_name='app_connections')
+    
+    # OAuth app identification
+    client_id = models.CharField(max_length=255, db_index=True, help_text="OAuth app client_id")
+    
+    # Cached app metadata (from OAuth server)
+    app_name = models.CharField(max_length=255)
+    app_logo = models.URLField(blank=True, null=True)
+    app_description = models.TextField(blank=True, null=True)
+    
+    # Approved scopes (stored as JSON array)
+    approved_scopes = models.JSONField(default=list, help_text="List of scopes user has approved")
+    
+    # Connection metadata
+    connected_at = models.DateTimeField(auto_now_add=True)
+    last_accessed = models.DateTimeField(default=timezone.now)
+    last_scope_update = models.DateTimeField(null=True, blank=True)
+    
+    # Revocation status
+    is_active = models.BooleanField(default=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    
+    class Meta:
+        db_table = 'user_app_connections'
+        verbose_name = 'User App Connection'
+        verbose_name_plural = 'User App Connections'
+        ordering = ['-connected_at']
+        unique_together = [['user', 'client_id']]
+        indexes = [
+            models.Index(fields=['user', 'is_active']),
+            models.Index(fields=['client_id', 'is_active']),
+        ]
+    
+    def __str__(self):
+        return f"{self.user.id} - {self.app_name} ({self.client_id})"
+    
+    def revoke(self):
+        """Revoke access to this app"""
+        self.is_active = False
+        self.revoked_at = timezone.now()
+        self.save(update_fields=['is_active', 'revoked_at'])
+    
+    def update_scopes(self, new_scopes):
+        """Update approved scopes"""
+        self.approved_scopes = new_scopes if isinstance(new_scopes, list) else list(new_scopes)
+        self.last_scope_update = timezone.now()
+        self.last_accessed = timezone.now()
+        self.save(update_fields=['approved_scopes', 'last_scope_update', 'last_accessed'])
+
+
 class UserPreferences(models.Model):
     """
     User preferences and settings (all encrypted)
@@ -116,6 +173,9 @@ class SecurityLog(models.Model):
         ('identity_downgrade', 'Identity Level Downgraded'),
         ('service_connected', 'Service Connected'),
         ('service_revoked', 'Service Revoked'),
+        ('app_connected', 'App Connected'),
+        ('app_revoked', 'App Access Revoked'),
+        ('app_scopes_updated', 'App Scopes Updated'),
         ('data_export', 'Data Exported'),
         ('account_settings', 'Account Settings Changed'),
     ]

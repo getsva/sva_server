@@ -8,6 +8,7 @@ from .views import (
     ZKLogoutView,
     ZKTokenRefreshView,
     ZKGetUserDataView,
+    ZKGetAllEncryptedDataView,
     ZKUpdateUserDataView,
     ZKDeleteAccountView,
     ZKPasskeyRegisterView,
@@ -58,6 +59,9 @@ urlpatterns = [
     
     # Get encrypted user data
     path('zk/user/data/', ZKGetUserDataView.as_view(), name='zk_user_data'),
+    
+    # Get all encrypted data (for master key rotation)
+    path('zk/user/all-encrypted-data/', ZKGetAllEncryptedDataView.as_view(), name='zk_all_encrypted_data'),
     
     # Update encrypted user data
     path('zk/user/update/', ZKUpdateUserDataView.as_view(), name='zk_user_update'),

@@ -3,7 +3,8 @@ from .models import (
     UserIdentityLevel,
     ConnectedService,
     UserPreferences,
-    SecurityLog
+    SecurityLog,
+    UserAppConnection
 )
 
 
@@ -95,3 +96,39 @@ class ChangePasswordSerializer(serializers.Serializer):
         if len(data.get('new_auth_proof', '')) < 40:
             raise serializers.ValidationError("Invalid authentication proof")
         return data
+
+
+class UserAppConnectionSerializer(serializers.ModelSerializer):
+    """Serializer for user app connections"""
+    class Meta:
+        model = UserAppConnection
+        fields = [
+            'id', 'client_id', 'app_name', 'app_logo', 'app_description',
+            'approved_scopes', 'connected_at', 'last_accessed',
+            'last_scope_update', 'is_active', 'revoked_at'
+        ]
+        read_only_fields = ['id', 'connected_at', 'last_accessed', 'last_scope_update']
+
+
+class UpdateAppScopesSerializer(serializers.Serializer):
+    """Serializer for updating app scopes"""
+    scopes = serializers.ListField(
+        child=serializers.CharField(max_length=255),
+        required=True,
+        allow_empty=True
+    )
+    
+    def validate_scopes(self, value):
+        if not isinstance(value, list):
+            raise serializers.ValidationError("Scopes must be a list")
+        return value
+
+
+class RevokeAppConnectionSerializer(serializers.Serializer):
+    """Serializer for revoking app connection"""
+    connection_id = serializers.UUIDField(required=True)
+    
+    def validate_connection_id(self, value):
+        if not UserAppConnection.objects.filter(id=value).exists():
+            raise serializers.ValidationError("App connection not found")
+        return value
