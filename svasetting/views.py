@@ -493,6 +493,46 @@ class UpdateAppScopesView(APIView):
         })
 
 
+class UpdateSharingBlobView(APIView):
+    """
+    Update encrypted sharing blob for an app connection (Google OAuth style - live updates)
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request, connection_id):
+        encrypted_blob = request.data.get('encrypted_blob')
+        salt = request.data.get('salt')
+        
+        if not encrypted_blob or not salt:
+            return Response(
+                {'error': 'encrypted_blob and salt are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            connection = UserAppConnection.objects.get(
+                id=connection_id,
+                user=request.user,
+                is_active=True
+            )
+        except UserAppConnection.DoesNotExist:
+            return Response(
+                {'error': 'App connection not found or revoked'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Update sharing blob (live update - Google OAuth style)
+        connection.encrypted_sharing_blob = encrypted_blob
+        connection.sharing_blob_salt = salt
+        connection.sharing_blob_encrypted_at = timezone.now()
+        connection.save(update_fields=['encrypted_sharing_blob', 'sharing_blob_salt', 'sharing_blob_encrypted_at'])
+        
+        return Response({
+            'message': 'Sharing blob updated successfully',
+            'encrypted_at': connection.sharing_blob_encrypted_at.isoformat()
+        })
+
+
 class RevokeAppConnectionView(APIView):
     """
     Revoke access for an app connection
@@ -602,6 +642,73 @@ class GetAppConnectionByClientIdView(APIView):
             return Response({
                 'exists': True,
                 'connection': UserAppConnectionSerializer(connection).data
+            })
+        except UserAppConnection.DoesNotExist:
+            return Response({
+                'exists': False
+            })
+
+
+class GetAppConnectionForUserInfoView(APIView):
+    """
+    Internal API endpoint for OAuth server to get UserAppConnection for UserInfo
+    Requires service token authentication
+    """
+    permission_classes = []  # Will use service token check
+    
+    def _require_service_token(self, request):
+        """Check service token"""
+        from django.conf import settings
+        header_name = getattr(settings, 'INTERNAL_SERVICE_HEADER', 'X-Service-Token')
+        expected = getattr(settings, 'INTERNAL_SERVICE_TOKEN', None)
+        
+        token = request.headers.get(header_name)
+        if not expected:
+            return False
+        if not token or token != expected:
+            return False
+        return True
+    
+    def get(self, request):
+        """Get UserAppConnection by client_id and user_id (subject)"""
+        if not self._require_service_token(request):
+            return Response(
+                {'error': 'Invalid service token'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        client_id = request.query_params.get('client_id')
+        user_id = request.query_params.get('user_id')  # This is the subject from OAuth
+        
+        if not client_id or not user_id:
+            return Response(
+                {'error': 'client_id and user_id are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            from authentication.models import ZKUser
+            user = ZKUser.objects.get(id=user_id)
+        except ZKUser.DoesNotExist:
+            return Response(
+                {'error': 'User not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        try:
+            connection = UserAppConnection.objects.get(
+                client_id=client_id,
+                user=user,
+                is_active=True
+            )
+            
+            # Return the encrypted sharing blob and salt
+            return Response({
+                'exists': True,
+                'encrypted_sharing_blob': connection.encrypted_sharing_blob,
+                'sharing_blob_salt': connection.sharing_blob_salt,
+                'approved_scopes': connection.approved_scopes,
+                'sharing_blob_encrypted_at': connection.sharing_blob_encrypted_at.isoformat() if connection.sharing_blob_encrypted_at else None,
             })
         except UserAppConnection.DoesNotExist:
             return Response({

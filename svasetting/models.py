@@ -101,6 +101,13 @@ class UserAppConnection(models.Model):
     # Approved scopes (stored as JSON array)
     approved_scopes = models.JSONField(default=list, help_text="List of scopes user has approved")
     
+    # Encrypted sharing blob (Google OAuth style - pre-encrypted data for instant sharing)
+    # This blob contains the user data for approved scopes, encrypted client-side
+    # When scopes change, this blob is updated instantly (live updates)
+    encrypted_sharing_blob = models.TextField(blank=True, null=True, help_text="Pre-encrypted sharing data blob for instant access")
+    sharing_blob_salt = models.TextField(blank=True, null=True, help_text="Salt for decrypting the sharing blob (base64 encoded)")
+    sharing_blob_encrypted_at = models.DateTimeField(null=True, blank=True, help_text="When the sharing blob was last encrypted/updated")
+    
     # Connection metadata
     connected_at = models.DateTimeField(auto_now_add=True)
     last_accessed = models.DateTimeField(default=timezone.now)

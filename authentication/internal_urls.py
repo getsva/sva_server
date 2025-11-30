@@ -5,11 +5,13 @@ from .views import (
     AuthRequestDetailProxyView,
     DataAttestationView,
 )
+from svasetting.views import GetAppConnectionForUserInfoView
 
 
 urlpatterns = [
     path('attest-data/', DataAttestationView.as_view(), name='data_attestation'),
     path('oauth/requests/<uuid:auth_request_id>/', AuthRequestDetailProxyView.as_view(), name='oauth_request_detail'),
     path('oauth/requests/<uuid:auth_request_id>/complete/', AuthRequestConsentProxyView.as_view(), name='oauth_request_complete'),
+    path('app-connections/userinfo/', GetAppConnectionForUserInfoView.as_view(), name='app_connection_userinfo'),
 ]
 

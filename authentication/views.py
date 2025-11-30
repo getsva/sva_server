@@ -773,37 +773,126 @@ class AuthRequestDetailProxyView(AuthServerClientMixin, APIView):
         try:
             from svasetting.models import UserAppConnection
             client_id = payload.get('client', {}).get('client_id')
+            
+            logger.info(
+                '🔍 Checking for existing connection: user=%s, client_id=%s, payload_client=%s',
+                request.user.id,
+                client_id,
+                payload.get('client', {})
+            )
+            
             if client_id:
                 try:
+                    # Check for any connection (active or revoked)
                     connection = UserAppConnection.objects.get(
                         user=request.user,
-                        client_id=client_id,
-                        is_active=True
+                        client_id=client_id
                     )
-                    existing_scopes = set(connection.approved_scopes or [])
-                    requested_scopes = set(payload.get('requested_scopes', []))
                     
-                    # If all requested scopes were previously approved, mark for auto-approval
-                    if requested_scopes and requested_scopes.issubset(existing_scopes):
+                    logger.info(
+                        '✅✅✅ Found connection for user %s, app %s: active=%s, approved_scopes=%s, connection_id=%s',
+                        request.user.id,
+                        client_id,
+                        connection.is_active,
+                        connection.approved_scopes,
+                        connection.id
+                    )
+                    
+                    if connection.is_active:
+                        # Active connection - Google OAuth style: auto-approve for returning users
+                        existing_scopes = set(connection.approved_scopes or [])
+                        requested_scopes = set(payload.get('requested_scopes', []) or [])
+                        
+                        logger.info(
+                            '🔍 Connection found - Scope comparison: requested=%s, existing=%s, is_active=%s',
+                            requested_scopes,
+                            existing_scopes,
+                            connection.is_active
+                        )
+                        
+                        # Google OAuth style: If app is already connected and active, ALWAYS auto-approve
+                        # User already trusts the app, so we auto-approve even if new scopes are requested
+                        can_auto_approve = True  # Always auto-approve for active connections
+                        
+                        if requested_scopes:
+                            if requested_scopes.issubset(existing_scopes):
+                                # All requested scopes already approved
+                                logger.info(
+                                    '✅ All requested scopes already approved: %s - auto-approving',
+                                    requested_scopes
+                                )
+                            else:
+                                # New scopes requested, but app is already connected - auto-approve anyway
+                                new_scopes = requested_scopes - existing_scopes
+                                logger.info(
+                                    '✅ App already connected, auto-approving new scopes: %s (existing: %s, requested: %s)',
+                                    new_scopes,
+                                    existing_scopes,
+                                    requested_scopes
+                                )
+                        elif existing_scopes:
+                            # No specific scopes requested but user has approved scopes
+                            logger.info('✅ No requested scopes, but user has approved scopes - auto-approving')
+                        else:
+                            # No scopes at all - still auto-approve if connection exists
+                            logger.info('✅ No scopes requested or approved - auto-approving for basic auth')
+                        
+                        # Always set can_auto_approve=True for active connections (Google OAuth style)
                         payload['can_auto_approve'] = True
                         payload['existing_connection'] = {
                             'id': str(connection.id),
                             'approved_scopes': connection.approved_scopes,
                             'connected_at': connection.connected_at.isoformat(),
+                            'is_active': True,
                         }
+                        # Update last_accessed timestamp
+                        connection.last_accessed = timezone.now()
+                        connection.save(update_fields=['last_accessed'])
+                        logger.info(
+                            '✅✅✅ AUTO-APPROVING consent for user %s, app %s (existing active connection - Google OAuth style)',
+                            request.user.id,
+                            client_id
+                        )
                     else:
+                        # Connection exists but is revoked - don't auto-approve
                         payload['can_auto_approve'] = False
                         payload['existing_connection'] = {
                             'id': str(connection.id),
                             'approved_scopes': connection.approved_scopes,
+                            'is_active': False,
                         }
+                        logger.info(
+                            '⚠️ Connection exists but is revoked - showing consent screen for user %s, app %s',
+                            request.user.id,
+                            client_id
+                        )
+                        payload['is_revoked'] = True
                 except UserAppConnection.DoesNotExist:
+                    # No connection found - first time user
                     payload['can_auto_approve'] = False
                     payload['existing_connection'] = None
+                    payload['is_revoked'] = False
+                    logger.warning(
+                        '🆕❌ No existing connection found for user %s, app %s - showing consent screen',
+                        request.user.id,
+                        client_id
+                    )
+                    # Debug: Check if there are any connections for this user at all
+                    user_connections = UserAppConnection.objects.filter(user=request.user)
+                    logger.info(
+                        '🔍 Debug: User %s has %s total connections: %s',
+                        request.user.id,
+                        user_connections.count(),
+                        list(user_connections.values_list('client_id', 'is_active', 'app_name'))
+                    )
         except Exception as exc:
             # Don't fail the request if connection check fails
-            logger.debug('Failed to check existing connection: %s', exc)
+            logger.warning('Failed to check existing connection: %s', exc, exc_info=True)
+            # Default to not auto-approve if check fails
+            if 'can_auto_approve' not in payload:
+                payload['can_auto_approve'] = False
             payload['can_auto_approve'] = False
+            payload['is_revoked'] = False
         
         return Response(payload)
 
@@ -814,7 +903,9 @@ class ConsentCompletionSerializer(serializers.Serializer):
         required=False,
         allow_empty=True,
     )
-    data_token = serializers.CharField()
+    data_token = serializers.CharField(required=False, allow_blank=True)
+    encrypted_sharing_blob = serializers.CharField(required=False, allow_blank=True)
+    sharing_blob_salt = serializers.CharField(required=False, allow_blank=True)
 
 
 class AuthRequestConsentProxyView(AuthServerClientMixin, APIView):
@@ -875,6 +966,8 @@ class AuthRequestConsentProxyView(AuthServerClientMixin, APIView):
                 app_logo=client_info.get('logo'),
                 app_description=client_info.get('description'),
                 approved_scopes=data.get('approved_scopes', []),
+                encrypted_sharing_blob=data.get('encrypted_sharing_blob'),
+                sharing_blob_salt=data.get('sharing_blob_salt'),
             )
         except Exception as exc:
             # Log but don't fail the consent flow if connection tracking fails
@@ -882,7 +975,7 @@ class AuthRequestConsentProxyView(AuthServerClientMixin, APIView):
 
         return Response(response.json())
     
-    def _create_or_update_app_connection(self, user, client_id, app_name, app_logo=None, app_description=None, approved_scopes=None):
+    def _create_or_update_app_connection(self, user, client_id, app_name, app_logo=None, app_description=None, approved_scopes=None, encrypted_sharing_blob=None, sharing_blob_salt=None):
         """Create or update UserAppConnection after consent"""
         if not client_id:
             return
@@ -902,11 +995,21 @@ class AuthRequestConsentProxyView(AuthServerClientMixin, APIView):
             connection.revoked_at = None
             connection.last_accessed = timezone.now()
             
+            # Update encrypted sharing blob if provided (Google OAuth style - live data sharing)
+            if encrypted_sharing_blob and sharing_blob_salt:
+                connection.encrypted_sharing_blob = encrypted_sharing_blob
+                connection.sharing_blob_salt = sharing_blob_salt
+                connection.sharing_blob_encrypted_at = timezone.now()
+                logger.info('Updated sharing blob for app connection %s', connection.id)
+            
             # Only update scopes if they changed
             if approved_scopes and set(connection.approved_scopes) != set(approved_scopes):
                 connection.update_scopes(approved_scopes)
             else:
-                connection.save(update_fields=['app_name', 'app_logo', 'app_description', 'is_active', 'revoked_at', 'last_accessed'])
+                update_fields = ['app_name', 'app_logo', 'app_description', 'is_active', 'revoked_at', 'last_accessed']
+                if encrypted_sharing_blob:
+                    update_fields.extend(['encrypted_sharing_blob', 'sharing_blob_salt', 'sharing_blob_encrypted_at'])
+                connection.save(update_fields=update_fields)
             
             # Log the action (only log scope update if scopes actually changed)
             if approved_scopes and set(connection.approved_scopes) != set(approved_scopes):
@@ -922,6 +1025,9 @@ class AuthRequestConsentProxyView(AuthServerClientMixin, APIView):
                 app_logo=app_logo or '',
                 app_description=app_description or '',
                 approved_scopes=approved_scopes or [],
+                encrypted_sharing_blob=encrypted_sharing_blob or '',
+                sharing_blob_salt=sharing_blob_salt or '',
+                sharing_blob_encrypted_at=timezone.now() if encrypted_sharing_blob else None,
                 is_active=True,
                 last_accessed=timezone.now(),
             )

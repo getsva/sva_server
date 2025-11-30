@@ -12,6 +12,7 @@ from .views import (
     ListAppConnectionsView,
     GetAppConnectionView,
     UpdateAppScopesView,
+    UpdateSharingBlobView,
     RevokeAppConnectionView,
     RestoreAppConnectionView,
     GetAppConnectionByClientIdView
@@ -46,6 +47,7 @@ urlpatterns = [
     path('zk/settings/app-connections/by-client-id/', GetAppConnectionByClientIdView.as_view(), name='get_app_connection_by_client_id'),
     path('zk/settings/app-connections/<uuid:connection_id>/', GetAppConnectionView.as_view(), name='get_app_connection'),
     path('zk/settings/app-connections/<uuid:connection_id>/scopes/', UpdateAppScopesView.as_view(), name='update_app_scopes'),
+    path('zk/settings/app-connections/<uuid:connection_id>/sharing-blob/', UpdateSharingBlobView.as_view(), name='update_sharing_blob'),
     path('zk/settings/app-connections/<uuid:connection_id>/revoke/', RevokeAppConnectionView.as_view(), name='revoke_app_connection'),
     path('zk/settings/app-connections/<uuid:connection_id>/restore/', RestoreAppConnectionView.as_view(), name='restore_app_connection'),
 ]
