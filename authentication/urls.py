@@ -27,6 +27,7 @@ from .views import (
     ZKTwoFactorDisableView,
     ZKActiveSessionsView,
     ZKTwoFactorLoginVerifyView,
+    WaitlistJoinView,
 )
 
 urlpatterns = [
@@ -104,4 +105,9 @@ urlpatterns = [
     
     # Active sessions management
     path('zk/security/sessions/', ZKActiveSessionsView.as_view(), name='zk_active_sessions'),
+    
+    # ========== Waitlist Endpoints ==========
+    
+    # Join waitlist
+    path('waitlist/join/', WaitlistJoinView.as_view(), name='waitlist_join'),
 ]

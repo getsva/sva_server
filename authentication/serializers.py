@@ -612,3 +612,28 @@ class ZKTwoFactorLoginVerifySerializer(serializers.Serializer):
         max_length=6,
         help_text="TOTP code from authenticator app"
     )
+
+
+class WaitlistEntrySerializer(serializers.Serializer):
+    """
+    Serializer for waitlist entry with SVA encryption
+    """
+    encrypted_data = serializers.CharField(
+        required=True,
+        help_text="AES-256-GCM encrypted waitlist data (base64)"
+    )
+    salt = serializers.CharField(
+        required=True,
+        max_length=255,
+        help_text="Cryptographic salt for key derivation (base64)"
+    )
+    email_hash = serializers.CharField(
+        required=True,
+        max_length=64,
+        help_text="SHA-256 hash of email for duplicate checking"
+    )
+    consent_to_updates = serializers.BooleanField(
+        required=False,
+        default=True,
+        help_text="Whether user consented to receive updates"
+    )

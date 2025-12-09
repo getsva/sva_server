@@ -21,7 +21,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import ZKUser, ZKRefreshToken, ZKEmailVerificationToken, ZKTwoFactorAuth, ZKTwoFactorLoginSession, ZKTwoFactorLoginSession
+from .models import ZKUser, ZKRefreshToken, ZKEmailVerificationToken, ZKTwoFactorAuth, ZKTwoFactorLoginSession, ZKTwoFactorLoginSession, WaitlistEntry
 from identity_canvas.models import IdentityCanvas, CanvasHistory, VerificationCanvas, VerificationCanvasHistory
 from svasetting.models import UserPreferences, ConnectedService, UserIdentityLevel
 from .serializers import (
@@ -42,6 +42,7 @@ from .serializers import (
     ZKTwoFactorVerifySerializer,
     ZKTwoFactorDisableSerializer,
     ZKTwoFactorLoginVerifySerializer,
+    WaitlistEntrySerializer,
 )
 from .token_utils import generate_access_token, generate_refresh_token, generate_data_token
 
@@ -1728,3 +1729,43 @@ class ZKTwoFactorLoginVerifyView(APIView):
             "auth_method": temp_session.auth_method,
             "requires_2fa": False
         }, status=status.HTTP_200_OK)
+
+
+# ==================== WAITLIST VIEWS ====================
+
+class WaitlistJoinView(APIView):
+    """
+    Join the waitlist with SVA encryption
+    Public endpoint - no authentication required
+    """
+    permission_classes = [AllowAny]
+    
+    def post(self, request):
+        serializer = WaitlistEntrySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        email_hash = serializer.validated_data['email_hash']
+        encrypted_data = serializer.validated_data['encrypted_data']
+        salt = serializer.validated_data['salt']
+        consent_to_updates = serializer.validated_data.get('consent_to_updates', True)
+        
+        # Check if email already exists in waitlist
+        if WaitlistEntry.objects.filter(email_hash=email_hash).exists():
+            return Response(
+                {"error": "This email is already on the waitlist."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Create waitlist entry
+        waitlist_entry = WaitlistEntry.objects.create(
+            encrypted_data=encrypted_data,
+            salt=salt,
+            email_hash=email_hash,
+            consent_to_updates=consent_to_updates
+        )
+        
+        return Response({
+            "message": "Successfully joined the waitlist!",
+            "id": str(waitlist_entry.id),
+            "created_at": waitlist_entry.created_at.isoformat()
+        }, status=status.HTTP_201_CREATED)

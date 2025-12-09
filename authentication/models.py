@@ -314,3 +314,52 @@ class ZKTwoFactorAuth(models.Model):
     
     def __str__(self):
         return f"2FA for {self.user.id} ({'Enabled' if self.is_enabled else 'Disabled'})"
+
+
+class WaitlistEntry(models.Model):
+    """
+    Waitlist entry with SVA encryption
+    Stores encrypted waitlist data (email, name, etc.)
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Encrypted waitlist data (email, name, company, role, use_case, etc.)
+    encrypted_data = models.TextField(
+        help_text="AES-256-GCM encrypted waitlist data (base64)"
+    )
+    
+    # Salt used for encryption (generated per entry)
+    salt = models.CharField(
+        max_length=255,
+        help_text="Cryptographic salt for key derivation (base64)"
+    )
+    
+    # Email hash for duplicate checking (SHA-256)
+    email_hash = models.CharField(
+        max_length=64,
+        db_index=True,
+        help_text="SHA-256 hash of email for duplicate checking"
+    )
+    
+    # Consent to updates
+    consent_to_updates = models.BooleanField(
+        default=True,
+        help_text="Whether user consented to receive updates"
+    )
+    
+    # Metadata
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'waitlist_entries'
+        verbose_name = 'Waitlist Entry'
+        verbose_name_plural = 'Waitlist Entries'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['email_hash']),
+            models.Index(fields=['created_at']),
+        ]
+    
+    def __str__(self):
+        return f"Waitlist Entry {self.id} ({self.email_hash[:8]}...)"

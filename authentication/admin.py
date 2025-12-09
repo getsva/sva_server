@@ -1,7 +1,7 @@
 # authentication/admin.py
 
 from django.contrib import admin
-from .models import ZKUser, ZKRefreshToken, ZKPasswordResetToken, ZKEmailVerificationToken
+from .models import ZKUser, ZKRefreshToken, ZKPasswordResetToken, ZKEmailVerificationToken, WaitlistEntry
 
 
 @admin.register(ZKUser)
@@ -34,3 +34,12 @@ class ZKEmailVerificationTokenAdmin(admin.ModelAdmin):
     search_fields = ('email_hash', 'token')
     list_filter = ('is_used', 'created_at')
     readonly_fields = ('id', 'created_at', 'token')
+
+
+@admin.register(WaitlistEntry)
+class WaitlistEntryAdmin(admin.ModelAdmin):
+    list_display = ('id', 'email_hash', 'consent_to_updates', 'created_at', 'updated_at')
+    search_fields = ('email_hash',)
+    list_filter = ('consent_to_updates', 'created_at')
+    readonly_fields = ('id', 'created_at', 'updated_at', 'encrypted_data', 'salt', 'email_hash')
+    ordering = ('-created_at',)
