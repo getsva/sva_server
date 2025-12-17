@@ -929,10 +929,17 @@ class AuthRequestConsentProxyView(AuthServerClientMixin, APIView):
                 auth_request_data = auth_request_response.json()
                 client_info = auth_request_data.get('client', {})
             else:
-                logger.warning('Failed to fetch auth request details: %s', auth_request_response.text)
+                logger.error('Failed to fetch auth request details: %s', auth_request_response.text)
+                return Response(
+                    {'error': 'Failed to retrieve app details for connection'},
+                    status=status.HTTP_502_BAD_GATEWAY
+                )
         except RequestException as exc:
-            logger.warning('Failed to fetch auth request details: %s', exc)
-            client_info = {}
+            logger.error('Failed to fetch auth request details: %s', exc)
+            return Response(
+                {'error': 'Failed to communicate with auth server'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
 
         payload = {
             'auth_request_id': str(auth_request_id),
@@ -959,6 +966,7 @@ class AuthRequestConsentProxyView(AuthServerClientMixin, APIView):
             return Response(payload, status=response.status_code)
 
         # Create or update UserAppConnection after successful consent
+        # CRITICAL: This must succeed to maintain data integrity
         try:
             self._create_or_update_app_connection(
                 user=request.user,
@@ -971,8 +979,13 @@ class AuthRequestConsentProxyView(AuthServerClientMixin, APIView):
                 sharing_blob_salt=data.get('sharing_blob_salt'),
             )
         except Exception as exc:
-            # Log but don't fail the consent flow if connection tracking fails
-            logger.error('Failed to create/update app connection: %s', exc, exc_info=True)
+            # Log critical error - data integrity issue
+            logger.critical('CRITICAL: Failed to create/update app connection after consent: %s', exc, exc_info=True)
+            # We arguably should return an error here, but the code has already been issued (in previous step).
+            # Ideally we would rollback, but we can't easily undo the OAuth code issue.
+            # For now, we log critical so we can investigate. 
+            # In a distributed transaction we would need 2PC.
+            # But making the first step fail fast (client_info fetch) solves 99% of cases.
 
         return Response(response.json())
     
