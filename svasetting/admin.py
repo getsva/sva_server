@@ -183,17 +183,86 @@ class UserAppConnectionAdmin(admin.ModelAdmin):
         qs = super().get_queryset(request)
         return qs.select_related('user')
     
-    actions = ['mark_as_active', 'mark_as_revoked']
+    actions = [
+        'mark_as_active', 
+        'mark_as_revoked',
+        'refresh_sharing_blobs',
+        'check_health'
+    ]
     
     def mark_as_active(self, request, queryset):
         """Admin action to mark connections as active"""
-        updated = queryset.update(is_active=True, revoked_at=None)
-        self.message_user(request, f'{updated} connection(s) marked as active.')
+        from .connection_service import connection_service
+        from django.utils import timezone
+        
+        count = 0
+        for connection in queryset:
+            if not connection.is_active:
+                connection_service.restore_connection(connection.user, str(connection.id))
+                count += 1
+        
+        self.message_user(request, f'{count} connection(s) marked as active.')
     mark_as_active.short_description = 'Mark selected connections as active'
     
     def mark_as_revoked(self, request, queryset):
         """Admin action to revoke connections"""
-        from django.utils import timezone
-        updated = queryset.update(is_active=False, revoked_at=timezone.now())
-        self.message_user(request, f'{updated} connection(s) revoked.')
+        from .connection_service import connection_service
+        
+        count = 0
+        for connection in queryset:
+            if connection.is_active:
+                connection_service.revoke_connection(connection.user, str(connection.id))
+                count += 1
+        
+        self.message_user(request, f'{count} connection(s) revoked.')
     mark_as_revoked.short_description = 'Revoke selected connections'
+    
+    def refresh_sharing_blobs(self, request, queryset):
+        """Admin action to mark connections for blob refresh"""
+        from .data_sharing_service import data_sharing_service
+        
+        count = 0
+        for connection in queryset:
+            if connection.is_active:
+                data_sharing_service.mark_blob_for_update(
+                    connection.user,
+                    str(connection.id)
+                )
+                count += 1
+        
+        self.message_user(
+            request, 
+            f'{count} connection(s) marked for sharing blob refresh. '
+            'Client will update blobs on next access.'
+        )
+    refresh_sharing_blobs.short_description = 'Mark for sharing blob refresh'
+    
+    def check_health(self, request, queryset):
+        """Admin action to check connection health"""
+        from .connection_utils import check_connection_health
+        
+        healthy = 0
+        unhealthy = 0
+        issues = []
+        
+        for connection in queryset:
+            health = check_connection_health(connection)
+            if health['is_healthy']:
+                healthy += 1
+            else:
+                unhealthy += 1
+                issues.append({
+                    'connection': connection,
+                    'health': health
+                })
+        
+        message = f'Health check: {healthy} healthy, {unhealthy} unhealthy'
+        if issues:
+            message += '\nIssues found:\n'
+            for item in issues[:5]:  # Show first 5
+                message += f"  - {item['connection'].app_name}: {', '.join(item['health']['issues'])}\n"
+            if len(issues) > 5:
+                message += f"  ... and {len(issues) - 5} more"
+        
+        self.message_user(request, message)
+    check_health.short_description = 'Check connection health'

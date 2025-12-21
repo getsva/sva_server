@@ -138,10 +138,23 @@ class UserAppConnection(models.Model):
         self.save(update_fields=['is_active', 'revoked_at'])
     
     def update_scopes(self, new_scopes):
-        """Update approved scopes"""
-        self.approved_scopes = new_scopes if isinstance(new_scopes, list) else list(new_scopes)
+        """
+        Update approved scopes with proper normalization and validation
+        Production-level: Ensures data consistency
+        """
+        # Normalize: ensure it's a list, remove duplicates, sort for consistency
+        if not isinstance(new_scopes, list):
+            new_scopes = list(new_scopes) if new_scopes else []
+        
+        # Remove duplicates and sort for consistency
+        normalized_scopes = sorted(list(set(new_scopes)))
+        
+        # Update fields
+        self.approved_scopes = normalized_scopes
         self.last_scope_update = timezone.now()
         self.last_accessed = timezone.now()
+        
+        # Save with explicit field update
         self.save(update_fields=['approved_scopes', 'last_scope_update', 'last_accessed'])
 
 

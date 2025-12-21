@@ -613,9 +613,15 @@ class AuthServerClientMixin:
         headers = kwargs.pop('headers', {}) or {}
         headers[settings.INTERNAL_SERVICE_HEADER] = settings.INTERNAL_SERVICE_TOKEN
 
-        timeout = getattr(settings, 'INTERNAL_SERVICE_TIMEOUT', 5)
+        # Use longer timeout for consent completion operations (they may take longer)
+        default_timeout = getattr(settings, 'INTERNAL_SERVICE_TIMEOUT', 5)
+        # For consent completion, use longer timeout (30 seconds) as it involves DB operations
+        if '/consent-complete/' in endpoint:
+            timeout = getattr(settings, 'CONSENT_COMPLETION_TIMEOUT', 30)
+        else:
+            timeout = default_timeout
 
-        logger.debug('Calling auth service %s %s', method.upper(), url)
+        logger.debug('Calling auth service %s %s (timeout: %s)', method.upper(), url, timeout)
         response = requests.request(method, url, headers=headers, timeout=timeout, **kwargs)
         return response
 
@@ -945,14 +951,39 @@ class AuthRequestConsentProxyView(AuthServerClientMixin, APIView):
             'auth_request_id': str(auth_request_id),
             'user_id': str(request.user.id),
             'approved_scopes': data.get('approved_scopes', []),
-            'data_token': data['data_token'],
+            'data_token': data.get('data_token', ''),  # Optional - can be empty for simplified flow
         }
 
+        response = None
         try:
             response = self._call_auth_service(
                 'post',
                 f"{self.auth_base_path}/internal/consent-complete/",
                 json=payload,
+            )
+        except requests.Timeout as exc:
+            logger.warning('Timeout calling auth server for consent completion: %s', exc)
+            # Even if we timeout, try to create the connection if we have the data
+            # The OAuth server may have completed the operation successfully
+            # This is a best-effort approach to maintain data integrity
+            if client_info.get('client_id'):
+                try:
+                    self._create_or_update_app_connection(
+                        user=request.user,
+                        client_id=client_info.get('client_id'),
+                        app_name=client_info.get('name', 'Unknown App'),
+                        app_logo=client_info.get('logo'),
+                        app_description=client_info.get('description'),
+                        approved_scopes=data.get('approved_scopes', []),
+                        encrypted_sharing_blob=data.get('encrypted_sharing_blob'),
+                        sharing_blob_salt=data.get('sharing_blob_salt'),
+                    )
+                    logger.info('Created app connection despite timeout - operation may have succeeded on OAuth server')
+                except Exception as conn_exc:
+                    logger.error('Failed to create connection after timeout: %s', conn_exc)
+            return Response(
+                {'error': 'oauth_service_timeout', 'message': 'Consent completion may have succeeded. Please check your connection status.'},
+                status=status.HTTP_504_GATEWAY_TIMEOUT
             )
         except RequestException as exc:
             logger.error('Failed to notify auth server of consent completion: %s', exc)
@@ -990,70 +1021,51 @@ class AuthRequestConsentProxyView(AuthServerClientMixin, APIView):
         return Response(response.json())
     
     def _create_or_update_app_connection(self, user, client_id, app_name, app_logo=None, app_description=None, approved_scopes=None, encrypted_sharing_blob=None, sharing_blob_salt=None):
-        """Create or update UserAppConnection after consent"""
+        """
+        Create or update UserAppConnection after consent
+        Production-level: Preserves manually managed scopes to prevent overwriting user's permission settings
+        """
         if not client_id:
             return
         
-        from svasetting.models import UserAppConnection, SecurityLog
-        from django.utils import timezone
+        from svasetting.connection_service import connection_service
         
-        try:
-            connection = UserAppConnection.objects.get(user=user, client_id=client_id)
-            # Connection exists - update it
-            connection.app_name = app_name
-            if app_logo:
-                connection.app_logo = app_logo
-            if app_description:
-                connection.app_description = app_description
-            connection.is_active = True
-            connection.revoked_at = None
-            connection.last_accessed = timezone.now()
-            
-            # Update encrypted sharing blob if provided (Google OAuth style - live data sharing)
-            if encrypted_sharing_blob and sharing_blob_salt:
-                connection.encrypted_sharing_blob = encrypted_sharing_blob
-                connection.sharing_blob_salt = sharing_blob_salt
-                connection.sharing_blob_encrypted_at = timezone.now()
-                logger.info('Updated sharing blob for app connection %s', connection.id)
-            
-            # Only update scopes if they changed
-            if approved_scopes and set(connection.approved_scopes) != set(approved_scopes):
-                connection.update_scopes(approved_scopes)
-            else:
-                update_fields = ['app_name', 'app_logo', 'app_description', 'is_active', 'revoked_at', 'last_accessed']
-                if encrypted_sharing_blob:
-                    update_fields.extend(['encrypted_sharing_blob', 'sharing_blob_salt', 'sharing_blob_encrypted_at'])
-                connection.save(update_fields=update_fields)
-            
-            # Log the action (only log scope update if scopes actually changed)
-            if approved_scopes and set(connection.approved_scopes) != set(approved_scopes):
-                log_type = 'app_scopes_updated'
-            else:
-                log_type = 'app_connected'  # Reconnection
-        except UserAppConnection.DoesNotExist:
-            # Create new connection
-            connection = UserAppConnection.objects.create(
-                user=user,
-                client_id=client_id,
-                app_name=app_name,
-                app_logo=app_logo or '',
-                app_description=app_description or '',
-                approved_scopes=approved_scopes or [],
-                encrypted_sharing_blob=encrypted_sharing_blob or '',
-                sharing_blob_salt=sharing_blob_salt or '',
-                sharing_blob_encrypted_at=timezone.now() if encrypted_sharing_blob else None,
-                is_active=True,
-                last_accessed=timezone.now(),
-            )
-            log_type = 'app_connected'
-        
-        # Log the action
-        SecurityLog.objects.create(
+        # Check if connection exists and was manually updated
+        existing_connection = connection_service.get_connection(
             user=user,
-            log_type=log_type,
-            ip_address=None,  # Could be passed from request if needed
-            user_agent=None,
+            client_id=client_id,
+            active_only=False
         )
+        
+        preserve_existing_scopes = False
+        if existing_connection and existing_connection.last_scope_update is not None:
+            # Connection was manually managed - preserve existing scopes
+            # Only allow reducing scopes (user denied some in consent), not adding new ones
+            original_scopes = set(existing_connection.approved_scopes) if existing_connection.approved_scopes else set()
+            new_scopes_set = set(approved_scopes) if approved_scopes else set()
+            
+            if new_scopes_set and not new_scopes_set.issubset(original_scopes):
+                # New scopes include permissions not in existing - preserve existing
+                preserve_existing_scopes = True
+                logger.info(
+                    'Preserving manually-managed scopes for connection %s: keeping %s (ignoring consent scopes: %s)',
+                    existing_connection.id, original_scopes, new_scopes_set
+                )
+        
+        # Use connection service to create/update
+        connection = connection_service.create_or_update_connection(
+            user=user,
+            client_id=client_id,
+            app_name=app_name,
+            approved_scopes=approved_scopes or [],
+            app_logo=app_logo,
+            app_description=app_description,
+            encrypted_sharing_blob=encrypted_sharing_blob,
+            sharing_blob_salt=sharing_blob_salt,
+            preserve_existing_scopes=preserve_existing_scopes
+        )
+        
+        logger.info('Created/updated app connection %s for user %s', connection.id, user.id)
 
 
 # ==================== EMAIL VERIFICATION VIEWS ====================

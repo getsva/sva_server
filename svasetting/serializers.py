@@ -111,7 +111,7 @@ class UserAppConnectionSerializer(serializers.ModelSerializer):
 
 
 class UpdateAppScopesSerializer(serializers.Serializer):
-    """Serializer for updating app scopes"""
+    """Serializer for updating app scopes with production-level validation"""
     scopes = serializers.ListField(
         child=serializers.CharField(max_length=255),
         required=True,
@@ -121,7 +121,19 @@ class UpdateAppScopesSerializer(serializers.Serializer):
     def validate_scopes(self, value):
         if not isinstance(value, list):
             raise serializers.ValidationError("Scopes must be a list")
-        return value
+        
+        # Normalize: remove duplicates and empty strings
+        normalized = [s.strip() for s in value if s and s.strip()]
+        
+        # Remove duplicates while preserving order (then we'll sort in the view)
+        seen = set()
+        unique_scopes = []
+        for scope in normalized:
+            if scope not in seen:
+                seen.add(scope)
+                unique_scopes.append(scope)
+        
+        return unique_scopes
 
 
 class RevokeAppConnectionSerializer(serializers.Serializer):

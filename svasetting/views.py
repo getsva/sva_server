@@ -1,11 +1,14 @@
 # authentication/settings_views.py
 
+import logging
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.utils import timezone
 from django.db import transaction
+
+logger = logging.getLogger(__name__)
 
 from .models import (
     UserIdentityLevel,
@@ -415,6 +418,7 @@ class GetSecurityLogsView(APIView):
 class ListAppConnectionsView(APIView):
     """
     List all app connections for the authenticated user
+    Uses ConnectionService for centralized management
     """
     permission_classes = [IsAuthenticated]
     
@@ -422,41 +426,46 @@ class ListAppConnectionsView(APIView):
         # Get active connections by default, but allow filtering
         include_revoked = request.query_params.get('include_revoked', 'false').lower() == 'true'
         
-        queryset = UserAppConnection.objects.filter(user=request.user)
-        if not include_revoked:
-            queryset = queryset.filter(is_active=True)
-        
-        connections = queryset.order_by('-connected_at')
+        from .connection_service import connection_service
+        connections = connection_service.list_connections(
+            user=request.user,
+            include_revoked=include_revoked
+        )
         
         return Response({
             'connections': UserAppConnectionSerializer(connections, many=True).data,
-            'total': connections.count()
+            'total': len(connections)
         })
 
 
 class GetAppConnectionView(APIView):
     """
     Get details of a specific app connection
+    Uses ConnectionService for centralized management
     """
     permission_classes = [IsAuthenticated]
     
     def get(self, request, connection_id):
-        try:
-            connection = UserAppConnection.objects.get(
-                id=connection_id,
-                user=request.user
-            )
-            return Response(UserAppConnectionSerializer(connection).data)
-        except UserAppConnection.DoesNotExist:
+        from .connection_service import connection_service
+        connection = connection_service.get_connection_by_id(
+            user=request.user,
+            connection_id=connection_id,
+            active_only=False
+        )
+        
+        if not connection:
             return Response(
                 {'error': 'App connection not found'},
                 status=status.HTTP_404_NOT_FOUND
             )
+        
+        return Response(UserAppConnectionSerializer(connection).data)
 
 
 class UpdateAppScopesView(APIView):
     """
     Update approved scopes for an app connection
+    Uses ConnectionService for centralized management
     """
     permission_classes = [IsAuthenticated]
     
@@ -464,27 +473,37 @@ class UpdateAppScopesView(APIView):
         serializer = UpdateAppScopesSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
-        try:
-            connection = UserAppConnection.objects.get(
-                id=connection_id,
-                user=request.user,
-                is_active=True
-            )
-        except UserAppConnection.DoesNotExist:
+        from .connection_service import connection_service
+        from .data_sharing_service import data_sharing_service
+        
+        new_scopes = serializer.validated_data['scopes']
+        
+        connection = connection_service.update_scopes(
+            user=request.user,
+            connection_id=connection_id,
+            new_scopes=new_scopes
+        )
+        
+        if not connection:
             return Response(
                 {'error': 'App connection not found or revoked'},
                 status=status.HTTP_404_NOT_FOUND
             )
         
-        new_scopes = serializer.validated_data['scopes']
-        connection.update_scopes(new_scopes)
-        
-        # Log the action
-        SecurityLog.objects.create(
+        # Update security log with request metadata (if exists)
+        latest_log = SecurityLog.objects.filter(
             user=request.user,
-            log_type='app_scopes_updated',
-            ip_address=request.META.get('REMOTE_ADDR'),
-            user_agent=request.META.get('HTTP_USER_AGENT')
+            log_type='app_scopes_updated'
+        ).order_by('-created_at').first()
+        if latest_log:
+            latest_log.ip_address = request.META.get('REMOTE_ADDR')
+            latest_log.user_agent = request.META.get('HTTP_USER_AGENT')
+            latest_log.save(update_fields=['ip_address', 'user_agent'])
+        
+        # Mark blob for update (client will handle actual update)
+        data_sharing_service.mark_blob_for_update(
+            user=request.user,
+            connection_id=connection_id
         )
         
         return Response({
@@ -496,6 +515,7 @@ class UpdateAppScopesView(APIView):
 class UpdateSharingBlobView(APIView):
     """
     Update encrypted sharing blob for an app connection (Google OAuth style - live updates)
+    Uses DataSharingService for centralized blob management
     """
     permission_classes = [IsAuthenticated]
     
@@ -509,119 +529,142 @@ class UpdateSharingBlobView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        try:
-            connection = UserAppConnection.objects.get(
-                id=connection_id,
-                user=request.user,
-                is_active=True
+        from .data_sharing_service import data_sharing_service
+        from .connection_service import connection_service
+        
+        # Validate blob format
+        if not data_sharing_service.validate_sharing_blob(encrypted_blob, salt):
+            return Response(
+                {'error': 'Invalid sharing blob format'},
+                status=status.HTTP_400_BAD_REQUEST
             )
-        except UserAppConnection.DoesNotExist:
+        
+        # Get connection
+        connection = connection_service.get_connection_by_id(
+            user=request.user,
+            connection_id=connection_id,
+            active_only=True
+        )
+        
+        if not connection:
             return Response(
                 {'error': 'App connection not found or revoked'},
                 status=status.HTTP_404_NOT_FOUND
             )
         
-        # Update sharing blob (live update - Google OAuth style)
-        connection.encrypted_sharing_blob = encrypted_blob
-        connection.sharing_blob_salt = salt
-        connection.sharing_blob_encrypted_at = timezone.now()
-        connection.save(update_fields=['encrypted_sharing_blob', 'sharing_blob_salt', 'sharing_blob_encrypted_at'])
+        # Update sharing blob
+        success = data_sharing_service.update_sharing_blob_for_connection(
+            connection=connection,
+            encrypted_blob=encrypted_blob,
+            salt=salt
+        )
+        
+        if not success:
+            return Response(
+                {'error': 'Failed to update sharing blob'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+        # Refresh connection to get updated timestamp
+        connection.refresh_from_db()
         
         return Response({
             'message': 'Sharing blob updated successfully',
-            'encrypted_at': connection.sharing_blob_encrypted_at.isoformat()
+            'encrypted_at': connection.sharing_blob_encrypted_at.isoformat(),
+            'timestamp': connection.sharing_blob_encrypted_at.isoformat()  # Alias for compatibility
         })
 
 
 class RevokeAppConnectionView(APIView):
     """
     Revoke access for an app connection
+    Uses ConnectionService for centralized management
     """
     permission_classes = [IsAuthenticated]
     
     def post(self, request, connection_id):
-        try:
-            connection = UserAppConnection.objects.get(
-                id=connection_id,
-                user=request.user
-            )
-            
-            if not connection.is_active:
-                return Response(
-                    {'error': 'App connection already revoked'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            connection.revoke()
-            
-            # Log the action
-            SecurityLog.objects.create(
-                user=request.user,
-                log_type='app_revoked',
-                ip_address=request.META.get('REMOTE_ADDR'),
-                user_agent=request.META.get('HTTP_USER_AGENT')
-            )
-            
-            return Response({
-                'message': 'App access revoked successfully',
-                'connection': UserAppConnectionSerializer(connection).data
-            })
-            
-        except UserAppConnection.DoesNotExist:
+        from .connection_service import connection_service
+        
+        connection = connection_service.revoke_connection(
+            user=request.user,
+            connection_id=connection_id
+        )
+        
+        if not connection:
             return Response(
                 {'error': 'App connection not found'},
                 status=status.HTTP_404_NOT_FOUND
             )
+        
+        if not connection.is_active:
+            return Response(
+                {'error': 'App connection already revoked'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Update security log with request metadata (if exists)
+        latest_log = SecurityLog.objects.filter(
+            user=request.user,
+            log_type='app_revoked'
+        ).order_by('-created_at').first()
+        if latest_log:
+            latest_log.ip_address = request.META.get('REMOTE_ADDR')
+            latest_log.user_agent = request.META.get('HTTP_USER_AGENT')
+            latest_log.save(update_fields=['ip_address', 'user_agent'])
+        
+        return Response({
+            'message': 'App access revoked successfully',
+            'connection': UserAppConnectionSerializer(connection).data
+        })
 
 
 class RestoreAppConnectionView(APIView):
     """
     Restore/Re-enable a revoked app connection
+    Uses ConnectionService for centralized management
     """
     permission_classes = [IsAuthenticated]
     
     def post(self, request, connection_id):
-        try:
-            connection = UserAppConnection.objects.get(
-                id=connection_id,
-                user=request.user
-            )
-            
-            if connection.is_active:
-                return Response(
-                    {'error': 'App connection is already active'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            # Restore the connection
-            connection.is_active = True
-            connection.revoked_at = None
-            connection.last_accessed = timezone.now()
-            connection.save(update_fields=['is_active', 'revoked_at', 'last_accessed'])
-            
-            # Log the action
-            SecurityLog.objects.create(
-                user=request.user,
-                log_type='app_connected',  # Reconnection
-                ip_address=request.META.get('REMOTE_ADDR'),
-                user_agent=request.META.get('HTTP_USER_AGENT')
-            )
-            
-            return Response({
-                'message': 'App access restored successfully',
-                'connection': UserAppConnectionSerializer(connection).data
-            })
-            
-        except UserAppConnection.DoesNotExist:
+        from .connection_service import connection_service
+        
+        connection = connection_service.restore_connection(
+            user=request.user,
+            connection_id=connection_id
+        )
+        
+        if not connection:
             return Response(
                 {'error': 'App connection not found'},
                 status=status.HTTP_404_NOT_FOUND
             )
+        
+        if connection.is_active:
+            return Response(
+                {'error': 'App connection is already active'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Update security log with request metadata (if exists)
+        latest_log = SecurityLog.objects.filter(
+            user=request.user,
+            log_type='app_connected'
+        ).order_by('-created_at').first()
+        if latest_log:
+            latest_log.ip_address = request.META.get('REMOTE_ADDR')
+            latest_log.user_agent = request.META.get('HTTP_USER_AGENT')
+            latest_log.save(update_fields=['ip_address', 'user_agent'])
+        
+        return Response({
+            'message': 'App access restored successfully',
+            'connection': UserAppConnectionSerializer(connection).data
+        })
 
 
 class GetAppConnectionByClientIdView(APIView):
     """
     Get app connection by client_id (for consent flow)
+    Uses ConnectionService for centralized management
     """
     permission_classes = [IsAuthenticated]
     
@@ -633,17 +676,19 @@ class GetAppConnectionByClientIdView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        try:
-            connection = UserAppConnection.objects.get(
-                client_id=client_id,
-                user=request.user,
-                is_active=True
-            )
+        from .connection_service import connection_service
+        connection = connection_service.get_connection(
+            user=request.user,
+            client_id=client_id,
+            active_only=True
+        )
+        
+        if connection:
             return Response({
                 'exists': True,
                 'connection': UserAppConnectionSerializer(connection).data
             })
-        except UserAppConnection.DoesNotExist:
+        else:
             return Response({
                 'exists': False
             })
@@ -652,6 +697,7 @@ class GetAppConnectionByClientIdView(APIView):
 class GetAppConnectionForUserInfoView(APIView):
     """
     Internal API endpoint for OAuth server to get UserAppConnection for UserInfo
+    Uses ConnectionService for centralized management
     Requires service token authentication
     """
     permission_classes = []  # Will use service token check
@@ -686,31 +732,232 @@ class GetAppConnectionForUserInfoView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        try:
-            from authentication.models import ZKUser
-            user = ZKUser.objects.get(id=user_id)
-        except ZKUser.DoesNotExist:
-            return Response(
-                {'error': 'User not found'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+        from .connection_service import connection_service
+        sharing_data = connection_service.get_sharing_data(
+            user_id=user_id,
+            client_id=client_id
+        )
         
-        try:
-            connection = UserAppConnection.objects.get(
-                client_id=client_id,
-                user=user,
-                is_active=True
-            )
-            
-            # Return the encrypted sharing blob and salt
-            return Response({
-                'exists': True,
-                'encrypted_sharing_blob': connection.encrypted_sharing_blob,
-                'sharing_blob_salt': connection.sharing_blob_salt,
-                'approved_scopes': connection.approved_scopes,
-                'sharing_blob_encrypted_at': connection.sharing_blob_encrypted_at.isoformat() if connection.sharing_blob_encrypted_at else None,
-            })
-        except UserAppConnection.DoesNotExist:
+        if sharing_data.get('exists'):
+            return Response(sharing_data)
+        else:
             return Response({
                 'exists': False
             })
+
+
+class ConnectionStatsView(APIView):
+    """
+    Get connection statistics
+    Admin or authenticated user can view stats
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        from .connection_registry import connection_registry
+        
+        # Get stats for current user or all users (if admin)
+        user = request.user if not request.user.is_staff else None
+        stats = connection_registry.get_connection_stats(user=user)
+        
+        return Response(stats)
+
+
+class ConnectionHealthView(APIView):
+    """
+    Check health of user's connections
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request, connection_id=None):
+        from .connection_utils import check_connection_health
+        from .connection_service import connection_service
+        
+        if connection_id:
+            # Check specific connection
+            connection = connection_service.get_connection_by_id(
+                user=request.user,
+                connection_id=connection_id,
+                active_only=False
+            )
+            
+            if not connection:
+                return Response(
+                    {'error': 'Connection not found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            health = check_connection_health(connection)
+            return Response(health)
+        else:
+            # Check all connections
+            connections = connection_service.list_connections(
+                user=request.user,
+                include_revoked=False
+            )
+            
+            results = []
+            for connection in connections:
+                health = check_connection_health(connection)
+                results.append({
+                    'connection_id': str(connection.id),
+                    'app_name': connection.app_name,
+                    'health': health
+                })
+            
+            return Response({
+                'connections': results,
+                'total': len(results),
+                'healthy': sum(1 for r in results if r['health']['is_healthy']),
+                'unhealthy': sum(1 for r in results if not r['health']['is_healthy'])
+            })
+
+
+class AppMetadataView(APIView):
+    """
+    Get app metadata from registry
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        client_id = request.query_params.get('client_id')
+        if not client_id:
+            return Response(
+                {'error': 'client_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        from .connection_registry import connection_registry
+        metadata = connection_registry.get_app_metadata(client_id)
+        
+        if not metadata:
+            return Response(
+                {'error': 'App metadata not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        return Response(metadata)
+
+
+class BatchRevokeConnectionsView(APIView):
+    """
+    Bulk revoke connections
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request):
+        connection_ids = request.data.get('connection_ids', [])
+        reason = request.data.get('reason')
+        
+        if not connection_ids:
+            return Response(
+                {'error': 'connection_ids is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        from .batch_operations import batch_operations
+        results = batch_operations.bulk_revoke_connections(
+            user=request.user,
+            connection_ids=connection_ids,
+            reason=reason
+        )
+        
+        return Response(results)
+
+
+class BatchUpdateMetadataView(APIView):
+    """
+    Bulk update app metadata for all connections with a client_id
+    Admin only or app owner
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request):
+        client_id = request.data.get('client_id')
+        name = request.data.get('name')
+        logo = request.data.get('logo')
+        description = request.data.get('description')
+        
+        if not client_id:
+            return Response(
+                {'error': 'client_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        from .batch_operations import batch_operations
+        results = batch_operations.bulk_update_metadata(
+            client_id=client_id,
+            name=name,
+            logo=logo,
+            description=description
+        )
+        
+        return Response(results)
+
+
+class BatchMarkForBlobUpdateView(APIView):
+    """
+    Bulk mark connections for blob update
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request):
+        connection_ids = request.data.get('connection_ids')
+        client_id = request.data.get('client_id')
+        
+        from .batch_operations import batch_operations
+        results = batch_operations.bulk_mark_for_blob_update(
+            user=request.user,
+            connection_ids=connection_ids,
+            client_id=client_id
+        )
+        
+        if 'error' in results:
+            return Response(
+                {'error': results['error']},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        return Response(results)
+
+
+class BatchHealthCheckView(APIView):
+    """
+    Bulk health check for connections
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        client_id = request.query_params.get('client_id')
+        
+        from .batch_operations import batch_operations
+        results = batch_operations.bulk_health_check(
+            user=request.user,
+            client_id=client_id
+        )
+        
+        return Response(results)
+
+
+class BatchUpdateScopesView(APIView):
+    """
+    Bulk update scopes for multiple connections
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request):
+        updates = request.data.get('updates', [])
+        
+        if not updates:
+            return Response(
+                {'error': 'updates is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        from .batch_operations import batch_operations
+        results = batch_operations.bulk_update_scopes(
+            user=request.user,
+            updates=updates
+        )
+        
+        return Response(results)
