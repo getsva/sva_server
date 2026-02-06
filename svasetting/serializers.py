@@ -24,14 +24,15 @@ class IdentityLevelSerializer(serializers.ModelSerializer):
 
 
 class ConnectedServiceSerializer(serializers.ModelSerializer):
-    """Serializer for connected services (returns encrypted data)"""
+    """Serializer for connected services (returns encrypted data + verification_token for partner apps)"""
     class Meta:
         model = ConnectedService
         fields = [
             'id', 'encrypted_service_data', 'shared_identity_level',
-            'connected_at', 'last_accessed', 'is_active', 'revoked_at'
+            'connected_at', 'last_accessed', 'is_active', 'revoked_at',
+            'verification_token'
         ]
-        read_only_fields = ['id', 'connected_at', 'last_accessed']
+        read_only_fields = ['id', 'connected_at', 'last_accessed', 'verification_token']
 
 
 class SecurityLogSerializer(serializers.ModelSerializer):
@@ -61,11 +62,21 @@ class UpdatePreferencesSerializer(serializers.Serializer):
 class VerifyIdentitySerializer(serializers.Serializer):
     """Serializer for identity verification requests"""
     verification_level = serializers.IntegerField(min_value=1, max_value=3)
-    encrypted_verification_data = serializers.CharField(required=True)
+    encrypted_verification_data = serializers.CharField(required=False, allow_blank=True, default='')
     
     def validate_verification_level(self, value):
         if value not in [1, 2, 3]:
             raise serializers.ValidationError("Invalid verification level")
+        return value
+
+
+class UpdateIdentityVerificationDataSerializer(serializers.Serializer):
+    """Serializer for updating only encrypted verification data (level already set)"""
+    encrypted_verification_data = serializers.CharField(required=True)
+    
+    def validate_encrypted_verification_data(self, value):
+        if not value or len(value) < 10:
+            raise serializers.ValidationError("Invalid encrypted verification data")
         return value
 
 

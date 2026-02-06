@@ -2,9 +2,12 @@ from django.urls import path
 from .views import (
     GetUserSettingsView,
     UpdatePreferencesView,
+    IdentityVerificationEligibilityView,
     VerifyIdentityLevelView,
+    UpdateIdentityVerificationDataView,
     ConnectServiceView,
     RevokeServiceView,
+    ValidateVerificationTokenView,
     DowngradeIdentityLevelView,
     ChangePasswordView,
     ExportUserDataView,
@@ -34,12 +37,16 @@ urlpatterns = [
     path('zk/settings/preferences/', UpdatePreferencesView.as_view(), name='update_preferences'),
     
     # Identity verification
+    path('zk/settings/identity-verification-eligibility/', IdentityVerificationEligibilityView.as_view(), name='identity_verification_eligibility'),
     path('zk/settings/verify-identity/', VerifyIdentityLevelView.as_view(), name='verify_identity'),
+    path('zk/settings/identity-verification-data/', UpdateIdentityVerificationDataView.as_view(), name='update_identity_verification_data'),
     path('zk/settings/downgrade-identity/', DowngradeIdentityLevelView.as_view(), name='downgrade_identity'),
     
     # Service management
     path('zk/settings/connect-service/', ConnectServiceView.as_view(), name='connect_service'),
     path('zk/settings/revoke-service/', RevokeServiceView.as_view(), name='revoke_service'),
+    # Public: validate verification token (partner apps; no auth; token is secret)
+    path('zk/verify-token/', ValidateVerificationTokenView.as_view(), name='validate_verification_token'),
     
     # Password/credentials management
     path('zk/settings/change-password/', ChangePasswordView.as_view(), name='change_password'),

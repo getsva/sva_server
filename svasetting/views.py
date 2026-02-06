@@ -2,7 +2,7 @@
 
 import logging
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.utils import timezone
@@ -17,12 +17,19 @@ from .models import (
     SecurityLog,
     UserAppConnection
 )
+from identity_canvas.models import (
+    VerifiedBlock,
+    DocumentVerification,
+    VerificationBlockType,
+)
+from . import identity_eligibility
 from .serializers import (
     IdentityLevelSerializer,
     ConnectedServiceSerializer,
     SecurityLogSerializer,
     UpdatePreferencesSerializer,
     VerifyIdentitySerializer,
+    UpdateIdentityVerificationDataSerializer,
     ConnectServiceSerializer,
     RevokeServiceSerializer,
     ChangePasswordSerializer,
@@ -123,10 +130,24 @@ class UpdatePreferencesView(APIView):
         )
 
 
+class IdentityVerificationEligibilityView(APIView):
+    """
+    GET: Return whether the user is eligible to upgrade to the next identity level.
+    Used by Settings to show only the "Verify" action when the user has completed
+    the required verifications (e.g. email+phone for L1, govt ID for L2).
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        eligibility = identity_eligibility.get_eligibility(request.user)
+        return Response(eligibility)
+
+
 class VerifyIdentityLevelView(APIView):
     """
-    Request identity level verification
-    Client sends encrypted verification documents/data
+    Request identity level verification.
+    Server enforces: only current_level + 1, and required verifications must be met
+    (e.g. VerifiedBlock/DocumentVerification). Client sends optional encrypted data.
     """
     permission_classes = [IsAuthenticated]
     
@@ -135,14 +156,25 @@ class VerifyIdentityLevelView(APIView):
         serializer.is_valid(raise_exception=True)
         
         verification_level = serializer.validated_data['verification_level']
-        encrypted_data = serializer.validated_data['encrypted_verification_data']
+        encrypted_data = serializer.validated_data.get('encrypted_verification_data') or ''
         
         identity_level, _ = UserIdentityLevel.objects.get_or_create(
             user=request.user
         )
+
+        # Enforce eligibility: only allow upgrading to next level when requirements are met
+        allowed, error_message = identity_eligibility.can_upgrade_to_level(
+            request.user, identity_level, verification_level
+        )
+        if not allowed:
+            return Response(
+                {'error': error_message},
+                status=status.HTTP_400_BAD_REQUEST
+            )
         
-        # Store encrypted verification data
-        identity_level.encrypted_verification_data = encrypted_data
+        # Store encrypted verification data only when provided
+        if encrypted_data:
+            identity_level.encrypted_verification_data = encrypted_data
         
         # Update verification timestamps based on level
         now = timezone.now()
@@ -154,9 +186,8 @@ class VerifyIdentityLevelView(APIView):
         elif verification_level == 3:
             identity_level.professional_verified_at = now
         
-        # Update current level if higher
-        if verification_level > identity_level.current_level:
-            identity_level.current_level = verification_level
+        # Update current level (already validated as current_level + 1)
+        identity_level.current_level = verification_level
         
         identity_level.save()
         
@@ -174,9 +205,31 @@ class VerifyIdentityLevelView(APIView):
         })
 
 
+class UpdateIdentityVerificationDataView(APIView):
+    """
+    Update only the encrypted verification data for the current identity level.
+    Use this to attach or update verification documents without changing level.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request):
+        serializer = UpdateIdentityVerificationDataSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        identity_level = UserIdentityLevel.objects.get(user=request.user)
+        identity_level.encrypted_verification_data = serializer.validated_data['encrypted_verification_data']
+        identity_level.save()
+
+        return Response({
+            'message': 'Verification data updated successfully',
+            'identity_level': IdentityLevelSerializer(identity_level).data
+        })
+
+
 class ConnectServiceView(APIView):
     """
-    Connect a new service/website with specific identity sharing level
+    Verification-only integrations (e.g. Verify with SVA); not for full OAuth app connections.
+    Connect a new service/website with specific identity sharing level.
     """
     permission_classes = [IsAuthenticated]
     
@@ -256,6 +309,29 @@ class RevokeServiceView(APIView):
                 {'error': 'Service not found'},
                 status=status.HTTP_404_NOT_FOUND
             )
+
+
+class ValidateVerificationTokenView(APIView):
+    """
+    Public endpoint for partner apps to validate a verification token.
+    Returns only level and valid flag (no PII). Token is invalid when user revokes the connection.
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        token = request.query_params.get('token', '').strip()
+        if not token:
+            return Response({'valid': False, 'error': 'Missing token'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            service = ConnectedService.objects.get(verification_token=token)
+        except ConnectedService.DoesNotExist:
+            return Response({'valid': False})
+        if not service.is_active:
+            return Response({'valid': False})
+        return Response({
+            'valid': True,
+            'level': service.shared_identity_level,
+        })
 
 
 class DowngradeIdentityLevelView(APIView):

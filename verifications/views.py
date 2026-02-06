@@ -32,6 +32,7 @@ from .serializers import (
     AadhaarVerifyOTPSerializer,
     CleanupVerificationDataSerializer,
 )
+from svasetting import identity_eligibility
 from .sandbox_client import SandboxKYCClient, SandboxAPIError, SandboxConfigurationError
 
 
@@ -139,6 +140,9 @@ class VerifyOTPView(APIView):
                 "verification_method": "otp",
             },
         )
+
+        # Auto-upgrade identity level when verifications are completed (event-driven)
+        identity_eligibility.sync_identity_level_from_verifications(user, request=request)
 
         return Response(
             {
@@ -402,6 +406,9 @@ class VerifyDocumentView(APIView):
                         'prefix': prefix,
                     }
                 )
+
+        # Auto-upgrade identity level when document verification completes (event-driven)
+        identity_eligibility.sync_identity_level_from_verifications(request.user, request=request)
 
         return Response(
             {

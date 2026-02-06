@@ -3,6 +3,12 @@ from django.utils import timezone
 from authentication.models import ZKUser
 import uuid
 import json
+import secrets
+
+
+def _default_verification_token():
+    """Generate a URL-safe token for partner apps to validate verification level (no PII)."""
+    return secrets.token_urlsafe(32)
 
 
 class UserIdentityLevel(models.Model):
@@ -71,6 +77,12 @@ class ConnectedService(models.Model):
     
     # Access permissions (encrypted)
     encrypted_permissions = models.TextField(blank=True, null=True)
+    
+    # Opaque token for partner apps: validate via API to get level only. Invalid when revoked.
+    verification_token = models.CharField(
+        max_length=64, unique=True, editable=False,
+        default=_default_verification_token, db_index=True
+    )
     
     class Meta:
         db_table = 'connected_services'
