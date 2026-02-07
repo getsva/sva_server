@@ -613,11 +613,12 @@ class AuthServerClientMixin:
         headers = kwargs.pop('headers', {}) or {}
         headers[settings.INTERNAL_SERVICE_HEADER] = settings.INTERNAL_SERVICE_TOKEN
 
-        # Use longer timeout for consent completion operations (they may take longer)
+        # Use longer timeout for operations that involve OAuth server DB or multiple steps
         default_timeout = getattr(settings, 'INTERNAL_SERVICE_TIMEOUT', 5)
-        # For consent completion, use longer timeout (30 seconds) as it involves DB operations
         if '/consent-complete/' in endpoint:
             timeout = getattr(settings, 'CONSENT_COMPLETION_TIMEOUT', 30)
+        elif '/auth-request-details/' in endpoint:
+            timeout = getattr(settings, 'AUTH_REQUEST_DETAILS_TIMEOUT', 25)
         else:
             timeout = default_timeout
 
@@ -652,19 +653,21 @@ class DataAttestationView(AuthServerClientMixin, APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        print(f"[ATTEST DEBUG] Received request.data: {request.data}")
         serializer = DataAttestationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        print(f"[ATTEST DEBUG] Validated data - claims: {data.get('claims')}, audience: {data.get('audience')}")
 
         if str(request.user.id) != str(data['user_id']):
             return Response({'error': 'user_id mismatch'}, status=status.HTTP_403_FORBIDDEN)
 
         try:
             auth_response = self._fetch_auth_request(data['auth_request_id'])
-        except RequestException:
-            return Response({'error': 'oauth_service_unavailable'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except RequestException as e:
+            logger.warning('OAuth auth server unreachable for attest-data: %s', e)
+            return Response(
+                {'error': 'oauth_service_unavailable', 'detail': 'Auth server did not respond in time or is unreachable.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
 
         if auth_response.status_code != status.HTTP_200_OK:
             logger.warning('Auth request validation failed: %s', auth_response.text)

@@ -12,6 +12,7 @@ from .views import (
     ChangePasswordView,
     ExportUserDataView,
     GetSecurityLogsView,
+    DashboardOverviewView,
     ListAppConnectionsView,
     GetAppConnectionView,
     UpdateAppScopesView,
@@ -56,6 +57,9 @@ urlpatterns = [
     
     # Security logs
     path('zk/settings/security-logs/', GetSecurityLogsView.as_view(), name='security_logs'),
+
+    # Dashboard overview (aggregate)
+    path('zk/settings/overview/', DashboardOverviewView.as_view(), name='dashboard_overview'),
     
     # App connections management
     path('zk/settings/app-connections/', ListAppConnectionsView.as_view(), name='list_app_connections'),

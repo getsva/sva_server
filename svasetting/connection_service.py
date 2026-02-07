@@ -70,10 +70,15 @@ class ConnectionService:
             
             # Handle scope updates
             if preserve_existing_scopes and was_manually_updated:
-                # Merge scopes: keep existing + add new
+                # CRITICAL: Keep ONLY existing scopes when user has manually managed permissions
+                # This prevents auto-approval from overwriting user's permission preferences
+                # e.g., if user removed 'name' scope, don't add it back during re-login
                 existing_scopes = set(connection.approved_scopes or [])
-                new_scopes = set(normalized_scopes)
-                final_scopes = sorted(list(existing_scopes | new_scopes))
+                final_scopes = sorted(list(existing_scopes))
+                logger.info(
+                    'Preserving existing scopes for connection %s: %s (ignoring requested: %s)',
+                    connection.id, final_scopes, normalized_scopes
+                )
             else:
                 # Replace scopes (or first-time creation)
                 final_scopes = normalized_scopes

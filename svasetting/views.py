@@ -822,6 +822,41 @@ class GetAppConnectionForUserInfoView(APIView):
             })
 
 
+class DashboardOverviewView(APIView):
+    """
+    Single endpoint for dashboard overview: verified credentials count,
+    connection stats, identity level, and recent security logs.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .connection_registry import connection_registry
+
+        user = request.user
+        # Connection stats for this user
+        stats = connection_registry.get_connection_stats(user=user)
+        # Verified blocks count (verifiable credentials)
+        verified_count = VerifiedBlock.objects.filter(user=user).count()
+        # Identity level
+        identity_level = None
+        try:
+            level_obj = UserIdentityLevel.objects.get(user=user)
+            identity_level = IdentityLevelSerializer(level_obj).data
+        except UserIdentityLevel.DoesNotExist:
+            pass
+        # Recent security logs
+        logs = SecurityLog.objects.filter(user=user).order_by('-created_at')[:10]
+        logs_data = SecurityLogSerializer(logs, many=True).data
+
+        return Response({
+            'verified_credentials_count': verified_count,
+            'connection_stats': stats,
+            'identity_level': identity_level,
+            'recent_activity': logs_data,
+            'activity_total': SecurityLog.objects.filter(user=user).count(),
+        })
+
+
 class ConnectionStatsView(APIView):
     """
     Get connection statistics

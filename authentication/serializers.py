@@ -586,7 +586,7 @@ class ZKTwoFactorVerifySerializer(serializers.Serializer):
 
 class ZKTwoFactorDisableSerializer(serializers.Serializer):
     """
-    Serializer for disabling 2FA
+    Serializer for disabling 2FA (accepts TOTP or backup code).
     """
     auth_proof = serializers.CharField(
         required=True,
@@ -594,14 +594,14 @@ class ZKTwoFactorDisableSerializer(serializers.Serializer):
     )
     totp_code = serializers.CharField(
         required=True,
-        max_length=6,
-        help_text="TOTP code to verify before disabling"
+        max_length=8,
+        help_text="TOTP code (6 digits) or backup code (8 characters) to verify before disabling"
     )
 
 
 class ZKTwoFactorLoginVerifySerializer(serializers.Serializer):
     """
-    Serializer for verifying 2FA during login
+    Serializer for verifying 2FA during login (TOTP or backup code).
     """
     temp_token = serializers.UUIDField(
         required=True,
@@ -609,8 +609,8 @@ class ZKTwoFactorLoginVerifySerializer(serializers.Serializer):
     )
     totp_code = serializers.CharField(
         required=True,
-        max_length=6,
-        help_text="TOTP code from authenticator app"
+        max_length=8,
+        help_text="TOTP code (6 digits) from authenticator app or backup code (8 characters)"
     )
 
 
