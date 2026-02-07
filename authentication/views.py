@@ -652,9 +652,11 @@ class DataAttestationView(AuthServerClientMixin, APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
+        print(f"[ATTEST DEBUG] Received request.data: {request.data}")
         serializer = DataAttestationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        print(f"[ATTEST DEBUG] Validated data - claims: {data.get('claims')}, audience: {data.get('audience')}")
 
         if str(request.user.id) != str(data['user_id']):
             return Response({'error': 'user_id mismatch'}, status=status.HTTP_403_FORBIDDEN)
