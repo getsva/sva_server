@@ -1,7 +1,7 @@
 # authentication/serializers.py
 
 from rest_framework import serializers
-from .models import ZKUser, ZKEmailVerificationToken
+from .models import ZKUser, ZKEmailVerificationToken, ZKTwoFactorAuth
 import hashlib
 import re
 
@@ -157,6 +157,8 @@ class ZKUserDetailsSerializer(serializers.ModelSerializer):
     """
     Public user details (non-sensitive metadata only)
     """
+    is_2fa_enabled = serializers.SerializerMethodField()
+
     class Meta:
         model = ZKUser
         fields = (
@@ -165,15 +167,29 @@ class ZKUserDetailsSerializer(serializers.ModelSerializer):
             'last_login', 
             'is_active', 
             'updated_at',
-            'has_passkey'  # Include passkey status
+            'has_passkey',  # Include passkey status
+            'is_2fa_enabled'
         )
         read_only_fields = fields
+
+    def get_is_2fa_enabled(self, obj):
+        # Check for passkey
+        if obj.has_passkey:
+            return True
+        
+        # Check for TOTP/2FA
+        try:
+            return ZKTwoFactorAuth.objects.get(user=obj).is_enabled
+        except ZKTwoFactorAuth.DoesNotExist:
+            return False
 
 
 class ZKUserDataSerializer(serializers.ModelSerializer):
     """
     Serializer for returning encrypted user data to client
     """
+    is_2fa_enabled = serializers.SerializerMethodField()
+    
     class Meta:
         model = ZKUser
         fields = (
@@ -184,11 +200,23 @@ class ZKUserDataSerializer(serializers.ModelSerializer):
             'last_login',
             'updated_at',
             'passkey_credential_id',  # Return credential ID for passkey login
-            'has_passkey'
+            'has_passkey',
+            'is_2fa_enabled'
         )
         read_only_fields = fields
     
     user_id = serializers.UUIDField(source='id', read_only=True)
+
+    def get_is_2fa_enabled(self, obj):
+        # Check for passkey
+        if obj.has_passkey:
+            return True
+        
+        # Check for TOTP/2FA
+        try:
+            return ZKTwoFactorAuth.objects.get(user=obj).is_enabled
+        except ZKTwoFactorAuth.DoesNotExist:
+            return False
 
 
 class ZKUpdateProfileSerializer(serializers.Serializer):
